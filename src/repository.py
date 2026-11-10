@@ -3,6 +3,9 @@
 Race protection (R5) lives here as a UNIQUE constraint on (machine_id, start_time), not as a
 pre-check: a second insert for a machine and slot that is already committed fails and the caller
 answers with the alternatives.
+
+Machine rows store id, code, type, state, changed_at — no price, no duration, no venue: the tariff
+and the cycle length are read through the type registry in src/domain.py.
 """
 
 import json
@@ -95,6 +98,16 @@ class Repository:
 
     def machine(self, code: str) -> dict | None:
         return self.db.one("SELECT * FROM machines WHERE code = ?", (code,))
+
+    def create_machine(self, type_key: str, at: datetime) -> dict:
+        """Insert a machine of a type; nothing else about it can be passed in."""
+        used = {row["code"] for row in self.db.rows("SELECT code FROM machines")}
+        counter = len(used) + 1
+        while f"M{counter}" in used:
+            counter += 1
+        self.db.execute("INSERT INTO machines (code, type, state, changed_at) VALUES (?, ?, ?, ?)",
+                        (f"M{counter}", type_key, "available", iso(at)))
+        return self.machine(f"M{counter}")
 
     def set_machine_state(self, machine_id: int, state: str, at: datetime) -> None:
         self.db.execute("UPDATE machines SET state = ?, changed_at = ? WHERE id = ?", (state, iso(at), machine_id))

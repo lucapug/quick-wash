@@ -48,8 +48,10 @@ class SeamClient:
     def get(self, path, headers=None) -> Response:
         return self._request("GET", path, None, headers)
 
-    def post(self, path, payload=None, headers=None) -> Response:
-        return self._request("POST", path, payload, headers)
+    def post(self, path, payload=None, headers=None, json=None) -> Response:
+        # `json=` is accepted as the body so a test can post a literal payload the way the
+        # HTTP clients in the issue bodies write it.
+        return self._request("POST", path, payload if payload is not None else json, headers)
 
     def session(self, email: str) -> Session:
         """Sign in as `email`: request the code (shown in-app), then verify it once."""

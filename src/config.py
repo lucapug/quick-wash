@@ -5,6 +5,10 @@ signed addendum's where it disagrees with docs/spec.md: turnover buffer 10 minut
 buffer 30 minutes (patch 2), OTP shown in-app with no email or SMS transport (patch 1).
 
 Inventory is the pack's seed: 8 machines, 4 standard, 2 family, 2 quick (tests/conftest.py).
+The split is 4 + 2 + 2: the pack fixes the total at 8 but not the split, and R7/R8 reassignment to a
+free machine of the same type needs at least two machines per type to be demonstrable while one is in
+`maintenance`. Every number here is read back over HTTP (issue #5, AC 7): nothing is editable
+through a screen, and no number is duplicated in a machine row.
 """
 
 SEED = {
@@ -20,8 +24,8 @@ SEED = {
     "grid_minutes": 15,
     "grace_minutes": 10,
     "cancel_window_minutes": 15,
-    "turnover_minutes": 10,
-    "cleaning_minutes": 30,
+    "turnover_buffer_minutes": 10,
+    "cleaning_buffer_minutes": 30,
     "idle_open_minutes": 15,
     "no_show_window_days": 30,
     "no_show_threshold": 2,

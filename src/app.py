@@ -5,6 +5,11 @@ and mirrored in docs/api-contract.md: POST /api/session, GET /api/availability, 
 GET /api/bookings, POST /api/lock/redeem, POST /api/lock/reports, GET /api/machines,
 GET /api/incidents.
 
+The contract fixes one path per entry, so the seed write for the machine inventory sits on the same
+path as its read (`POST /api/machines`, resolved through SEED_WRITE): the machine registry has no
+screen, the write accepts a type and nothing else, and the machine answers with the type's tariff
+and duration — never with a field of its own.
+
 Keys are English, user-facing copy is Italian. Nothing here logs a customer email, an unlock code
 or a one-time code.
 """
@@ -12,7 +17,7 @@ or a one-time code.
 import hashlib
 from datetime import datetime, timedelta
 
-from src import rules
+from src import domain, rules
 from src.clock import Clock
 from src.config import SEED
 from src.repository import Repository, parse
@@ -29,6 +34,11 @@ ROUTES = {
 }
 
 SEAM_PATHS = sorted(f"{method} {path}" for method, path in ROUTES)
+
+# The write that belongs to the seed inventory, on the contract path of its read. It takes `type`
+# and nothing else: there is no per-machine price or duration field to override, so the only thing
+# a caller can do is add a machine of a type (demo mode, no machine-registry screen).
+SEED_WRITE = {"POST /api/machines": "create_machine"}
 
 MACHINE_TRANSITIONS = {
     "available": {"reserved", "maintenance"},
@@ -61,7 +71,7 @@ class Application:
 
     def handle(self, method: str, path: str, body: dict | None = None,
                headers: dict | None = None) -> tuple[int, dict]:
-        name = ROUTES.get((method, path))
+        name = ROUTES.get((method, path)) or SEED_WRITE.get(f"{method} {path}")
         if name is None:
             return 404, {"error": "not_found", "message": f"Percorso sconosciuto: {path}"}
         try:
@@ -112,9 +122,10 @@ class Application:
         now = self.clock.now()
         day = now.date()
         open_day = day.strftime("%A") not in self.config["closed_days"]
+        inventory = self.repo.machine_counts()
         types = []
-        for type_key, count in self.config["types"].items():
-            tariff = self.config["tariffs"][type_key]
+        for type_key, count in inventory.items():
+            tariff = domain.tariff_of(type_key, self.config)
             starts = rules.valid_start_times(type_key, self.config, day)
             usable = [start for start in starts if start >= now]
             earliest = usable[0] if usable else now
@@ -122,9 +133,9 @@ class Application:
                     if machine["type"] == type_key and self.is_assignable(machine, earliest)]
             types.append({
                 "type": type_key,
-                "capacity_kg": tariff["capacity_kg"],
-                "cycle_minutes": tariff["cycle_minutes"],
-                "tokens": tariff["tokens"],
+                "capacity_kg": tariff.capacity_kg,
+                "cycle_minutes": tariff.cycle_minutes,
+                "tokens": tariff.tokens_required,
                 "machines": count,
                 "free": len(free),
                 "earliest_start": hhmm(usable[0]) if usable else None,
@@ -136,6 +147,8 @@ class Application:
             "closed_days": self.config["closed_days"],
             "grid_minutes": self.config["grid_minutes"],
             "types": types,
+            # AC 7: the seed numbers verbatim, so a reviewer can read them without reading code.
+            "config": domain.seed_view(inventory, self.config),
         }
 
     def why(self, type_key, now, open_day, usable, free) -> str:
@@ -161,9 +174,9 @@ class Application:
         changed = parse(machine["changed_at"])
         # R10: a finished machine stays unbookable for the turnover buffer, and a machine reported
         # still occupied stays out of circulation for the cleaning buffer (addendum patch 2).
-        if state == "finished" and now - changed < timedelta(minutes=self.config["turnover_minutes"]):
+        if state == "finished" and now - changed < timedelta(minutes=self.config["turnover_buffer_minutes"]):
             return False
-        if state == "cleaning_required" and now - changed < timedelta(minutes=self.config["cleaning_minutes"]):
+        if state == "cleaning_required" and now - changed < timedelta(minutes=self.config["cleaning_buffer_minutes"]):
             return False
         if state not in ("available", "finished", "cleaning_required"):
             return False
@@ -202,6 +215,7 @@ class Application:
         type_key = body.get("type")
         if type_key not in self.config["tariffs"]:
             return 400, {"error": "unknown_type", "message": "Tipo macchina sconosciuto"}
+        tariff = domain.tariff_of(type_key, self.config)
 
         start = self.parse_start(body.get("start"))
         if start is None:
@@ -300,7 +314,7 @@ class Application:
             return "closed day"
         if not self.is_inside_hours(start):
             return "outside opening hours"
-        cycle = timedelta(minutes=self.config["tariffs"][type_key]["cycle_minutes"])
+        cycle = timedelta(minutes=domain.tariff_of(type_key, self.config).cycle_minutes)
         close = datetime.combine(day, self._time_of(self.config["opening_hours"]["close"]))
         if start + cycle > close:
             return "cycle would overrun closing time"
@@ -373,8 +387,8 @@ class Application:
         if event == "cycle_finished":
             self.transition(booking["machine_id"], "finished", now)
             self.repo.set_booking_state(booking["id"], "finished")
-            free_at = now + timedelta(minutes=self.config["turnover_minutes"])
-            return 200, {"outcome": "finished", "turnover_minutes": self.config["turnover_minutes"],
+            free_at = now + timedelta(minutes=self.config["turnover_buffer_minutes"])
+            return 200, {"outcome": "finished", "turnover_minutes": self.config["turnover_buffer_minutes"],
                           "bookable_from": hhmm(free_at)}
 
         # idle_open: an event, not a state — unlocked with no cycle_started inside 15 minutes.
@@ -408,7 +422,7 @@ class Application:
             start = parse(booking["start_time"])
             if start <= now or booking["state"] in ("expired", "cancelled", "closed"):
                 continue
-            tariff = self.config["tariffs"][machine["type"]]
+            tariff = domain.tariff_of(machine["type"], self.config)
             replacement = self.pick_machine(machine["type"], start)
             if replacement is None:
                 self.repo.set_booking_state(booking["id"], "cancelled")
@@ -421,7 +435,7 @@ class Application:
                             (replacement["id"], new_code, booking["id"]))
             self.assign(replacement, now)
             reassigned.append({"booking": booking["id"], "machine": replacement["code"], "code": new_code,
-                               "start": hhmm(start), "tokens": tariff["tokens"]})
+                               "start": hhmm(start), "tokens": tariff.tokens_required})
             self.repo.record_incident("reassignment", now, f"moved off {machine['code']}",
                                       booking["email"], replacement["id"], booking["id"])
         return 200, {"outcome": "maintenance", "machine": machine["code"], "reassigned": reassigned,
@@ -454,12 +468,30 @@ class Application:
         self.assign(replacement, now)
         self.repo.record_incident("cleaning_required", now, f"reported still occupied on {machine['code']}",
                                   who["email"], machine["id"], booking["id"])
-        cleaned_at = now + timedelta(minutes=self.config["cleaning_minutes"])
+        cleaned_at = now + timedelta(minutes=self.config["cleaning_buffer_minutes"])
         return 200, {"outcome": "cleaning_required", "machine": machine["code"],
-                     "cleaning_minutes": self.config["cleaning_minutes"], "clean_until": hhmm(cleaned_at),
+                     "cleaning_minutes": self.config["cleaning_buffer_minutes"], "clean_until": hhmm(cleaned_at),
                      "reassigned": {"booking": booking["id"], "machine": replacement["code"], "code": new_code,
                                     "start": hhmm(start)},
                      "message": "Macchina in pulizia: sei stato spostato subito"}
+
+    # --- seed inventory (the machine registry is configuration, not a screen) ---
+
+    def handle_create_machine(self, body, headers):
+        """Add a machine of a type to the seed inventory.
+
+        Only `type` is accepted. Duration and tariff are answered by the type registry, so there is
+        no per-machine price field to override here and the same type always answers the same.
+        """
+        extra = sorted(key for key in body if key != "type")
+        if extra:
+            return 400, {"error": "override_not_allowed", "fields": extra,
+                          "message": "La macchina non ha un prezzo proprio: si sceglie solo il tipo"}
+        type_key = body.get("type")
+        if type_key not in self.config["tariffs"]:
+            return 400, {"error": "unknown_type", "message": "Tipo macchina sconosciuto"}
+        machine = self.repo.create_machine(type_key, self.clock.now())
+        return 201, domain.machine_view(machine, self.config)
 
     # --- owner panel ---------------------------------------------------------
 
@@ -471,7 +503,8 @@ class Application:
         for machine in self.repo.machines():
             attached = [row for row in self.repo.bookings_on_machine(machine["id"])
                         if row["state"] in ("confirmed", "unlocked", "running")]
-            board.append({"machine": machine["code"], "type": machine["type"], "state": machine["state"],
+            board.append({**domain.machine_view(machine, self.config),
+                          "machine": machine["code"],
                           "bookings": [self.booking_view(row, machine["code"]) for row in attached]})
         return 200, {"machines": board}
 
