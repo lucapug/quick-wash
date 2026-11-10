@@ -9,6 +9,9 @@ Per-machine pricing was explicitly rejected, so `cycle_minutes` and `tokens_requ
 through the type registry — the same type always answers the same.
 
 The numbers themselves are seed data in src/config.py; this module is the shape that reads them.
+
+The package holds the time half of the domain as a submodule: `src/domain/time.py` is the pure
+helper for valid start times, the refusal vocabulary and the next valid alternatives (R1, R2).
 """
 
 from dataclasses import dataclass

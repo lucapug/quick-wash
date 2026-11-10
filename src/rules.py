@@ -4,36 +4,27 @@ docs/spec.md (Testing Decisions) reserves unit tests for exactly these three pur
 valid start times per type, the grace window of a booking, the no-show counter and its block
 expiry. Anything else that would need the repository or the clock is asserted through the HTTP
 seam instead. No I/O here, no database, no clock object: inputs and outputs are data.
+
+The first of the three lives in src/domain/time.py, where the grid, the refusal vocabulary and the
+next valid alternatives are defined (issue R1+R2). This module delegates to it so the grid has one
+source: the unit test for the helper and the booking handler read the same function.
 """
 
 from datetime import date, datetime, timedelta
 
 from src.config import SEED
+from src.domain import time as start_times
 
 
 def valid_start_times(type_key: str, config: dict = SEED, day: date | None = None) -> list[datetime]:
     """Every grid start time on `day` that a cycle of `type_key` can actually honour (R1, R2).
 
-    A start is valid when it is inside opening hours, on an open day, on the 15-minute grid,
-    and `start + cycle_minutes` does not overrun closing time.
+    A start is valid when it is inside opening hours, on an open day, on the 15-minute grid
+    anchored at opening time, and `start + cycle_minutes` does not overrun closing time.
     """
-    tariff = config["tariffs"][type_key]
     if day is None:
         raise ValueError("valid_start_times needs a day")
-    if day.strftime("%A") in config["closed_days"]:
-        return []
-
-    open_time = datetime.combine(day, datetime.strptime(config["opening_hours"]["open"], "%H:%M").time())
-    close_time = datetime.combine(day, datetime.strptime(config["opening_hours"]["close"], "%H:%M").time())
-    grid = timedelta(minutes=config["grid_minutes"])
-    cycle = timedelta(minutes=tariff["cycle_minutes"])
-
-    starts = []
-    moment = open_time
-    while moment + cycle <= close_time:
-        starts.append(moment)
-        moment += grid
-    return starts
+    return start_times.valid_start_times(day, type_key, config)
 
 
 def grace_window(start: datetime, config: dict = SEED) -> tuple[datetime, datetime]:
