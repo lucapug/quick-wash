@@ -12,6 +12,12 @@ path as its read (`POST /api/machines`, resolved through SEED_WRITE): the machin
 screen, the write accepts a type and nothing else, and the machine answers with the type's tariff
 and duration — never with a field of its own.
 
+The public availability read is shaped in `src/availability.py`: the board for a request that names
+nothing, the window for a request that names a window or a type (issue #8). The query parameters of the
+public read join the body in `src/server.py`, and the request line telemetry sees stays the path without
+them. `is_assignable` is not a second rule: it delegates to the predicate the public view answers on, so
+the board and the window cannot drift.
+
 Keys are English, user-facing copy is Italian. Nothing here logs a customer email, an unlock code
 or a one-time code.
 """
@@ -19,7 +25,7 @@ or a one-time code.
 import hashlib
 from datetime import datetime, timedelta
 
-from src import domain, machine_states, rules
+from src import availability, domain, machine_states, rules
 from src.clock import Clock
 from src.domain import time as start_times
 from src.config import SEED
@@ -152,36 +158,53 @@ class Application:
     # --- availability (public, US8) ----------------------------------------
 
     def handle_availability(self, body, headers, path=None):
+        """US8: the public read, open to a passer-by with no session, answered per type.
+
+        The query decides which shape answers (see `src/availability.py`): the board when the caller names
+        nothing, the window when it names a window or a type. Nothing here asks for a session, and nothing
+        in either shape names a machine, a customer or a code (AC2, AC6).
+        """
         now = self.clock.now()
-        day = now.date()
-        open_day = day.strftime("%A") not in self.config["closed_days"]
+        open_day = start_times.is_open_day(now.date(), self.config)
         inventory = self.repo.machine_counts()
-        types = []
-        for type_key, count in inventory.items():
-            tariff = domain.tariff_of(type_key, self.config)
-            starts = start_times.valid_start_times(day, type_key, self.config)
-            usable = [start for start in starts if start >= now]
-            earliest = usable[0] if usable else now
-            free = [machine for machine in self.repo.machines()
-                    if machine["type"] == type_key and self.is_assignable(machine, earliest)]
-            types.append({
-                "type": type_key,
-                "capacity_kg": tariff.capacity_kg,
-                "cycle_minutes": tariff.cycle_minutes,
-                "tokens": tariff.tokens_required,
-                "machines": count,
-                "free": len(free),
-                "earliest_start": hhmm(usable[0]) if usable else None,
-                "why": self.why(type_key, now, open_day, usable, len(free)),
-            })
-        return 200, {
+        only = body.get("type")
+        if only is not None and only not in self.config["tariffs"]:
+            return 400, {"error": "unknown_type", "message": "Tipo macchina sconosciuto"}
+        common = {
             "open_now": open_day and self.is_inside_hours(now),
             "opening_hours": self.config["opening_hours"],
             "closed_days": self.config["closed_days"],
             "grid_minutes": self.config["grid_minutes"],
-            "types": types,
             # AC 7: the seed numbers verbatim, so a reviewer can read them without reading code.
             "config": domain.seed_view(inventory, self.config),
+        }
+        if availability.windowed(body):
+            hours = availability.window_hours(body)
+            return 200, {**common, "window_hours": hours,
+                          "types": availability.window_view(self.repo, self.config, now, hours, only)}
+        return 200, {**common, "types": [self.board_row(type_key, inventory[type_key], now) for type_key in inventory]}
+
+    def board_row(self, type_key: str, count: int, now) -> dict:
+        """One board row: the type, the inventory, the machines free at the earliest start, the tariff.
+
+        The free count goes through `is_assignable`, the same predicate the window answers on (AC7: a
+        machine inside its turnover buffer is not free).
+        """
+        tariff = domain.tariff_of(type_key, self.config)
+        usable = [start for start in start_times.valid_start_times(now.date(), type_key, self.config)
+                  if start >= now]
+        earliest = usable[0] if usable else now
+        free = len([machine for machine in self.repo.machines()
+                    if machine["type"] == type_key and self.is_assignable(machine, earliest)])
+        return {
+            "type": type_key,
+            "capacity_kg": tariff.capacity_kg,
+            "cycle_minutes": tariff.cycle_minutes,
+            "tokens": tariff.tokens_required,
+            "machines": count,
+            "free": free,
+            "earliest_start": hhmm(usable[0]) if usable else None,
+            "why": self.why(type_key, now, start_times.is_open_day(now.date(), self.config), usable, free),
         }
 
     def why(self, type_key, now, open_day, usable, free) -> str:
@@ -202,18 +225,13 @@ class Application:
         return datetime.strptime(value, "%H:%M").time()
 
     def is_assignable(self, machine, start) -> bool:
-        now = self.clock.now()
-        state = machine["state"]
-        changed = parse(machine["changed_at"])
-        # R10: a finished machine stays unbookable for the turnover buffer, and a machine reported
-        # still occupied stays out of circulation for the cleaning buffer (addendum patch 2).
-        if state == "finished" and now - changed < timedelta(minutes=self.config["turnover_buffer_minutes"]):
-            return False
-        if state == "cleaning_required" and now - changed < timedelta(minutes=self.config["cleaning_buffer_minutes"]):
-            return False
-        if state not in ("available", "finished", "cleaning_required"):
-            return False
-        return self.repo.booking_on_machine(machine["id"], start) is None
+        """The predicate the public view answers on, in one place (issue #8): `src/availability.py`.
+
+        R10 and addendum patch 2: a machine inside its turnover buffer, or inside its cleaning buffer
+        after being reported still occupied, is not free. R5: neither is a machine whose point is already
+        committed to a booking, and neither is a machine in `maintenance` (US42).
+        """
+        return availability.free_at(machine, start, self.config, availability.taken_turns(self.repo, [machine]))
 
     def pick_machine(self, type_key: str, start) -> dict | None:
         """First machine of the type that can actually be assigned for `start`."""

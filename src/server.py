@@ -5,12 +5,14 @@ into a call on `Application.handle`. The test fixture starts the same server on 
 ephemeral port, so a test drives the real HTTP boundary without anyone starting a service by hand.
 
 Telemetry here is the request line only: no body, no customer email, no unlock code, no one-time
-code (docs/spec.md, Observability shape).
+code (docs/spec.md, Observability shape). The query parameters of the public read (`window_hours`,
+`type`) join the body of the call, and the logged line is the path without them.
 """
 
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from src.app import Application
 from src.db import connect
@@ -26,8 +28,9 @@ def make_handler(app: Application):
 
         def answer(self, method):
             length = int(self.headers.get("Content-Length") or 0)
+            query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
             body = json.loads(self.rfile.read(length) or b"{}") if length else {}
-            status, payload = app.handle(method, self.path.split("?")[0], body, dict(self.headers))
+            status, payload = app.handle(method, self.path.split("?")[0], {**query, **body}, dict(self.headers))
             raw = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
