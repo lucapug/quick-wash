@@ -14,7 +14,7 @@ jobs:
   implement:
     if: (github.event.label.name == 'atomic' || github.event.label.name == 'complex') && github.event.issue.state == 'open'
     runs-on: [self-hosted, factory]
-    timeout-minutes: 20
+    timeout-minutes: 60
     permissions:
       contents: write
       pull-requests: write
