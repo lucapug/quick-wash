@@ -99,6 +99,11 @@ class Repository:
     def machine(self, code: str) -> dict | None:
         return self.db.one("SELECT * FROM machines WHERE code = ?", (code,))
 
+    def machine_by_id(self, machine_id: int) -> dict | None:
+        if machine_id is None:
+            return None
+        return self.db.one("SELECT * FROM machines WHERE id = ?", (machine_id,))
+
     def create_machine(self, type_key: str, at: datetime) -> dict:
         """Insert a machine of a type; nothing else about it can be passed in."""
         used = {row["code"] for row in self.db.rows("SELECT code FROM machines")}
@@ -149,10 +154,20 @@ class Repository:
             "SELECT * FROM bookings WHERE machine_id = ? AND start_time = ?", (machine_id, iso(start))
         )
 
+    def open_booking(self, machine_id: int) -> dict | None:
+        """The booking a device report about this machine belongs to: the one still attached to it."""
+        return self.db.one(
+            "SELECT * FROM bookings WHERE machine_id = ? AND state IN ('confirmed', 'unlocked', 'running') "
+            "ORDER BY start_time", (machine_id,)
+        )
+
     def set_booking_state(self, booking_id: int, state: str) -> None:
         self.db.execute("UPDATE bookings SET state = ? WHERE id = ?", (state, booking_id))
 
-    def record_redeemed(self, booking_id: int, now: datetime) -> None:
+    def record_open(self, booking_id: int, now: datetime) -> None:
+        """The moment the machine was opened. A device fact: an attempt refused by the grace window is
+        still an open, and `idle_open` is measured from it. The code is consumed only by a redemption
+        inside the window, which is what the booking state records (US26)."""
         self.db.execute("UPDATE bookings SET redeemed_at = ? WHERE id = ?", (iso(now), booking_id))
 
     def get_or_create_identity(self, email: str, is_owner: bool) -> dict:

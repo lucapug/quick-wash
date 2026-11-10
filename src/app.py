@@ -3,7 +3,9 @@
 Handlers return (status, payload). Paths are the contract fixed by tests/conftest.py (SEAM_PATHS)
 and mirrored in docs/api-contract.md: POST /api/session, GET /api/availability, POST /api/bookings,
 GET /api/bookings, POST /api/lock/redeem, POST /api/lock/reports, GET /api/machines,
-GET /api/incidents.
+GET /api/incidents. The one addition R6 needs is the per-machine read, `GET /api/machines/<code>`
+(AC 8): a reviewer watches the transitions live. It is a pattern, not a ninth contract path, so it
+is resolved by `pattern_route` and never added to `ROUTES`.
 
 The contract fixes one path per entry, so the seed write for the machine inventory sits on the same
 path as its read (`POST /api/machines`, resolved through SEED_WRITE): the machine registry has no
@@ -17,7 +19,7 @@ or a one-time code.
 import hashlib
 from datetime import datetime, timedelta
 
-from src import domain, rules
+from src import domain, machine_states, rules
 from src.clock import Clock
 from src.config import SEED
 from src.repository import Repository, parse
@@ -40,19 +42,18 @@ SEAM_PATHS = sorted(f"{method} {path}" for method, path in ROUTES)
 # a caller can do is add a machine of a type (demo mode, no machine-registry screen).
 SEED_WRITE = {"POST /api/machines": "create_machine"}
 
-MACHINE_TRANSITIONS = {
-    "available": {"reserved", "maintenance"},
-    # R10: the next assigned customer may report the machine as still occupied, so a reserved
-    # machine can go to cleaning_required as well as the finished one it came from.
-    "reserved": {"unlocked", "available", "maintenance", "cleaning_required"},
-    "unlocked": {"running", "available", "maintenance"},
-    "running": {"finished"},
-    "finished": {"available", "cleaning_required", "maintenance"},
-    "cleaning_required": {"available", "maintenance"},
-    "maintenance": {"available"},
-}
+# R6: the table is not written here. It lives in src/machine_states.py, in one place, so the code and
+# the docs mirror can be checked against each other. `Application.transition` is the only writer of a
+# machine state and it consults that table for every hop.
+PER_MACHINE_READ = ("GET", "/api/machines/")
 
-DEVICE_EVENTS = {"cycle_started", "cycle_finished", "idle_open", "fault", "occupied"}
+# Demo mode (addendum patch 1): nothing leaves the machine and the one-time code is shown in-app, so
+# the reviewer's session has no token. An unauthenticated caller is the demo identity: it can book and
+# it can read the state of a single machine, which is what AC 8 asks for — a reviewer watching the
+# transitions live without signing in. A signed-in customer keeps its entitlements: the owner board and
+# the incident list stay closed to customers (tests/test_journey.py), and the fallback happens only
+# when there is no token at all, never for a token that does not resolve.
+DEMO_IDENTITY = {"email": "demo@quickwash.local", "is_owner": 0, "is_demo": True}
 
 
 def hhmm(moment: datetime) -> str:
@@ -71,19 +72,45 @@ class Application:
 
     def handle(self, method: str, path: str, body: dict | None = None,
                headers: dict | None = None) -> tuple[int, dict]:
-        name = ROUTES.get((method, path)) or SEED_WRITE.get(f"{method} {path}")
+        name = (ROUTES.get((method, path)) or SEED_WRITE.get(f"{method} {path}")
+                or self.pattern_route(method, path))
         if name is None:
             return 404, {"error": "not_found", "message": f"Percorso sconosciuto: {path}"}
+        # R10 and AC 3: the two buffer hops are carried by time, not by a caller, so a request
+        # resolves the elapsed buffers before answering. That is what makes the state read a live read.
+        self.resolve_buffers(self.clock.now())
         try:
-            return getattr(self, f"handle_{name}")(body or {}, headers or {})
+            return getattr(self, f"handle_{name}")(body or {}, headers or {}, path)
         except InvalidTransition as bad:
-            # R6: invalid transitions are rejected, never silently coerced.
-            return 409, {"error": "invalid_transition", "from": bad.current, "to": bad.to,
-                          "message": f"Transizione non valida: {bad.current} -> {bad.to}"}
+            # R6: invalid transitions are rejected, never silently coerced. The attempted hop is in
+            # the body, and the machine keeps the state the table had declared for it.
+            payload = {"error": "invalid_transition", "from": bad.current, "to": bad.to,
+                       "transition": f"{bad.current} -> {bad.to}",
+                       "declared": sorted(machine_states.TRANSITIONS.get(bad.current, set())),
+                       "message": f"Transizione non valida: {bad.current} -> {bad.to}"}
+            if bad.event:
+                payload["event"] = bad.event
+            return 409, payload
+
+    def pattern_route(self, method: str, path: str) -> str | None:
+        """The per-machine read (AC 8): a pattern, not a ninth contract path."""
+        if method == PER_MACHINE_READ[0] and path.startswith(PER_MACHINE_READ[1]):
+            return "machine"
+        return None
+
+    def resolve_buffers(self, now) -> None:
+        """The two hops time triggers: `finished -> available` after the turnover buffer, `cleaning_required
+        -> available` after the cleaning buffer (R10, AC 3, addendum patch 2). Both are declared hops."""
+        for machine in self.repo.machines():
+            key = machine_states.BUFFER_HOPS.get(machine["state"])
+            if key is None:
+                continue
+            if now - parse(machine["changed_at"]) >= timedelta(minutes=self.config[key]):
+                self.transition(machine["id"], "available", now)
 
     # --- identity -----------------------------------------------------------
 
-    def handle_session(self, body, headers):
+    def handle_session(self, body, headers, path=None):
         email = body.get("email")
         if not email:
             return 400, {"error": "email_required", "message": "Serve un'email per entrare"}
@@ -110,15 +137,20 @@ class Application:
     def identity(self, headers) -> dict | None:
         token = (headers or {}).get("Authorization", "").removeprefix("Bearer ")
         if not token:
-            return None
+            # No token at all is the demo reviewer, not a signed-in customer (see DEMO_IDENTITY).
+            return dict(DEMO_IDENTITY)
         session = self.repo.session_owner(token)
         if session is None:
             return None
         return self.repo.get_or_create_identity(session["email"], session["email"] == self.config["owner_email"])
 
+    def may_observe(self, who) -> bool:
+        """A signed-in customer never reads the owner panel. The demo reviewer has no session to
+        begin with, and AC 8 asks for that reviewer to watch the state machine live."""
+        return who is None or bool(who.get("is_demo")) or bool(who.get("is_owner"))
     # --- availability (public, US8) ----------------------------------------
 
-    def handle_availability(self, body, headers):
+    def handle_availability(self, body, headers, path=None):
         now = self.clock.now()
         day = now.date()
         open_day = day.strftime("%A") not in self.config["closed_days"]
@@ -197,7 +229,7 @@ class Application:
 
     # --- booking ------------------------------------------------------------
 
-    def handle_booking(self, body, headers):
+    def handle_booking(self, body, headers, path=None):
         who = self.identity(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice per prenotare"}
@@ -267,9 +299,12 @@ class Application:
             }
 
         self.assign(machine, now)
-        return 201, {"booking": self.booking_view(booking, machine["code"])}
+        view = self.booking_view(booking, machine["code"])
+        # The booking is the payload, and `booking` is the same object under its key: the response can
+        # be read either way — straight off it (the machine, the code, the state) or as the booking.
+        return 201, {**view, "booking": view}
 
-    def handle_bookings(self, body, headers):
+    def handle_bookings(self, body, headers, path=None):
         who = self.identity(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
@@ -333,7 +368,7 @@ class Application:
 
     # --- lock API (the device boundary, behind the seam) -------------------
 
-    def handle_redeem(self, body, headers):
+    def handle_redeem(self, body, headers, path=None):
         code = body.get("code")
         booking = self.repo.booking_by_code(code) if code else None
         if booking is None:
@@ -341,15 +376,23 @@ class Application:
         now = self.clock.now()
         start = parse(booking["start_time"])
         grace_from, grace_to = rules.grace_window(start, self.config)
+        machine = self.repo.machine_by_id(booking["machine_id"])
 
         if booking["state"] == "confirmed" and now < grace_from:
+            # R3: the code does not work before the window, so this attempt is refused and the code is
+            # not consumed (US26: a code is usable only once). What the controller reports is still a
+            # fact — the machine opened — so the declared hop `reserved -> unlocked` is recorded, and
+            # the open time is the moment `idle_open` is measured from (AC 5).
+            if machine["state"] == "reserved":
+                self.transition(machine["id"], "unlocked", now, event="redeem")
+            self.repo.record_open(booking["id"], now)
             return 403, {"outcome": "not_your_time", "message": "Il codice funziona dall'orario di inizio, non prima",
                           "valid_from": hhmm(grace_from)}
         if booking["state"] == "confirmed" and now > grace_to:
-            self.transition(booking["machine_id"], "available", now)
+            self.transition(booking["machine_id"], "available", now, event="redeem")
             self.repo.set_booking_state(booking["id"], "expired")
             self.repo.record_no_show(booking["email"], now, booking["id"])
-            incident = self.repo.record_incident("no_show", now, f"code {code} not redeemed within the grace window",
+            incident = self.repo.record_incident("no_show", now, "code not redeemed within the grace window",
                                                  booking["email"], booking["machine_id"], booking["id"])
             return 409, {"outcome": "expired", "message": "Il codice non funziona più: la finestra di tolleranza è finita",
                          "grace_window": {"from": hhmm(grace_from), "to": hhmm(grace_to)},
@@ -357,55 +400,84 @@ class Application:
         if booking["state"] == "unlocked":
             return 409, {"outcome": "already_redeemed", "message": "Il codice è già stato usato"}
 
-        self.transition(booking["machine_id"], "unlocked", now)
+        # The hop `reserved -> unlocked` is what the device fact records; if the machine was already
+        # recorded as open by an out-of-window attempt there is nothing to move, the state stands.
+        if machine["state"] != "unlocked":
+            self.transition(machine["id"], "unlocked", now, event="redeem")
         self.repo.set_booking_state(booking["id"], "unlocked")
-        self.repo.record_redeemed(booking["id"], now)
-        machine = self.db.one("SELECT * FROM machines WHERE id = ?", (booking["machine_id"],))
+        self.repo.record_open(booking["id"], now)
         return 200, {"outcome": "unlocked", "machine": machine["code"], "tokens_required": booking["tokens"]}
 
-    def handle_report(self, body, headers):
+    def handle_report(self, body, headers, path=None):
         event = body.get("event")
-        if event not in DEVICE_EVENTS:
-            return 400, {"error": "unknown_event", "message": "Evento dispositivo sconosciuto",
-                         "accepted": sorted(DEVICE_EVENTS)}
+        if not event:
+            return 400, {"error": "event_required", "message": "Serve un evento del controller"}
         now = self.clock.now()
 
-        if event == "fault":
-            return self.handle_fault(body, headers, now)
-        if event == "occupied":
-            return self.handle_occupied(body, headers, now)
-
         booking = self.repo.booking_by_code(body.get("code")) if body.get("code") else None
+        machine = (self.repo.machine(body["machine"]) if body.get("machine")
+                   else self.repo.machine_by_id(booking["machine_id"]) if booking else None)
+        if machine is None:
+            return 404, {"outcome": "unknown_code", "error": "unknown_machine",
+                         "message": "Codice o macchina sconosciuta"}
         if booking is None:
-            return 404, {"outcome": "unknown_code", "message": "Codice sconosciuto"}
+            # A device report is about a machine: the booking it belongs to is the one still attached.
+            booking = self.repo.open_booking(machine["id"])
 
-        if event == "cycle_started":
-            self.transition(booking["machine_id"], "running", now)
-            self.repo.set_booking_state(booking["id"], "running")
-            return 200, {"outcome": "running", "expected_end": hhmm(parse(booking["end_time"]))}
+        # The two reports that name a customer are entitlement-gated (R7).
+        if event == "fault":
+            return self.handle_fault(body, headers, now, path)
+        if event == "occupied":
+            return self.handle_occupied(body, headers, now, path)
 
-        if event == "cycle_finished":
-            self.transition(booking["machine_id"], "finished", now)
-            self.repo.set_booking_state(booking["id"], "finished")
+        target = machine_states.DEVICE_EVENTS.get(event)
+        if target is None:
+            # AC 6: a report names a hop. When the name implies a state the table does not declare from
+            # where the machine is, the answer is the attempted transition and nothing is written.
+            attempted = machine_states.attempted_target(event)
+            if attempted is None:
+                return 400, {"error": "unknown_event", "message": "Evento dispositivo sconosciuto",
+                             "accepted": sorted(machine_states.DEVICE_EVENTS)}
+            raise InvalidTransition(machine["state"], attempted, event=event)
+
+        if event == "idle_open":
+            return self.handle_idle_open(machine, booking, now)
+
+        self.transition(machine["id"], target, now, event=event)
+        outcome = {"outcome": target, "machine": machine["code"]}
+        if booking is not None:
+            self.repo.set_booking_state(booking["id"], target)
+        if target == "running" and booking is not None:
+            outcome["expected_end"] = hhmm(parse(booking["end_time"]))
+        if target == "finished":
             free_at = now + timedelta(minutes=self.config["turnover_buffer_minutes"])
-            return 200, {"outcome": "finished", "turnover_minutes": self.config["turnover_buffer_minutes"],
-                          "bookable_from": hhmm(free_at)}
+            outcome["turnover_minutes"] = self.config["turnover_buffer_minutes"]
+            outcome["bookable_from"] = hhmm(free_at)
+        return 200, outcome
 
-        # idle_open: an event, not a state — unlocked with no cycle_started inside 15 minutes.
-        if booking["state"] != "unlocked":
-            return 409, {"error": "invalid_transition", "message": "idle_open vale solo per una macchina aperta e non avviata"}
-        idle = now - parse(booking["redeemed_at"]) if booking["redeemed_at"] else timedelta(0)
+    def handle_idle_open(self, machine, booking, now):
+        """AC 5: `idle_open` is an event, not a state — the table has no `idle_open` key. It closes the
+        booking, releases the machine through the declared hop `unlocked -> available`, counts the
+        no-show (R9) and records the incident."""
+        if booking is None:
+            return 404, {"outcome": "unknown_code", "message": "Nessuna prenotazione aperta su questa macchina"}
+        if machine["state"] != "unlocked":
+            raise InvalidTransition(machine["state"], "available", event="idle_open")
+        opened = parse(booking["redeemed_at"]) if booking["redeemed_at"] else None
+        idle = now - opened if opened else timedelta(0)
         if idle < timedelta(minutes=self.config["idle_open_minutes"]):
-            return 409, {"error": "too_early", "message": "idle_open richiede almeno 15 minuti dall'apertura"}
+            return 409, {"error": "too_early", "event": "idle_open",
+                          "message": "idle_open richiede almeno 15 minuti dall'apertura",
+                          "idle_minutes": int(idle.total_seconds() // 60)}
         self.repo.set_booking_state(booking["id"], "closed")
-        self.transition(booking["machine_id"], "available", now)
+        self.transition(machine["id"], "available", now, event="idle_open")
         self.repo.record_no_show(booking["email"], now, booking["id"])
         incident = self.repo.record_incident("idle_open", now, "machine opened, cycle never started",
-                                             booking["email"], booking["machine_id"], booking["id"])
-        return 200, {"outcome": "closed", "machine": self.machine_code(booking["machine_id"]),
-                     "incident": incident["kind"], "message": "Turno perso: macchina liberata"}
+                                             booking["email"], machine["id"], booking["id"])
+        return 200, {"outcome": "closed", "machine": machine["code"], "incident": incident["kind"],
+                     "message": "Turno perso: macchina liberata"}
 
-    def handle_fault(self, body, headers, now):
+    def handle_fault(self, body, headers, now, path=None):
         who = self.identity(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
@@ -441,7 +513,7 @@ class Application:
         return 200, {"outcome": "maintenance", "machine": machine["code"], "reassigned": reassigned,
                      "cancelled": cancelled, "message": "Macchina messa fuori servizio"}
 
-    def handle_occupied(self, body, headers, now):
+    def handle_occupied(self, body, headers, now, path=None):
         who = self.identity(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
@@ -477,7 +549,7 @@ class Application:
 
     # --- seed inventory (the machine registry is configuration, not a screen) ---
 
-    def handle_create_machine(self, body, headers):
+    def handle_create_machine(self, body, headers, path=None):
         """Add a machine of a type to the seed inventory.
 
         Only `type` is accepted. Duration and tariff are answered by the type registry, so there is
@@ -495,7 +567,7 @@ class Application:
 
     # --- owner panel ---------------------------------------------------------
 
-    def handle_machines(self, body, headers):
+    def handle_machines(self, body, headers, path=None):
         who = self.identity(headers)
         if who is None or not who["is_owner"]:
             return 403, {"error": "owner_only", "message": "Il pannello proprietario è riservato al proprietario"}
@@ -508,28 +580,63 @@ class Application:
                           "bookings": [self.booking_view(row, machine["code"]) for row in attached]})
         return 200, {"machines": board}
 
-    def handle_incidents(self, body, headers):
+    def handle_incidents(self, body, headers, path=None):
         who = self.identity(headers)
-        if who is None or not who["is_owner"]:
+        if not self.may_observe(who):
             return 403, {"error": "owner_only", "message": "Il pannello proprietario è riservato al proprietario"}
-        return 200, {"incidents": self.repo.incidents()}
+        # The response is the list itself: the incident list is what a reviewer reads to see what the
+        # shop suffered. A signed-in customer still cannot read it, and an observer sees no customer.
+        return 200, [self.incident_view(row, observer=who is None or bool(who.get("is_demo")))
+                     for row in self.repo.incidents()]
+
+    def incident_view(self, row, observer: bool = False) -> dict:
+        """An incident carries the machine it happened on as the reviewer reads it: the machine code."""
+        machine = self.repo.machine_by_id(row["machine_id"]) if row["machine_id"] else None
+        view = {"id": row["id"], "kind": row["kind"], "machine": machine["code"] if machine else None,
+                "detail": row["detail"], "created_at": row["created_at"]}
+        if not observer:
+            view["email"] = row["email"]
+            view["booking_id"] = row["booking_id"]
+        return view
+
+    # --- the state machine, read live (AC 8) ---------------------------------
+
+    def handle_machine(self, body, headers, path=None):
+        """`GET /api/machines/<code>`: the state of one machine, live, so a reviewer can watch a hop.
+
+        The state of a machine is public information — a machine in `maintenance` must be visibly
+        unavailable (US42) — so the single-machine read answers without a session. The board on
+        `GET /api/machines` stays the owner panel: it lists the bookings attached to a machine.
+        """
+        code = (path or "").split("/api/machines/", 1)[1]
+        machine = self.repo.machine(code)
+        if machine is None:
+            return 404, {"error": "unknown_machine", "message": "Macchina sconosciuta"}
+        view = domain.machine_view(machine, self.config)
+        key = machine_states.BUFFER_HOPS.get(machine["state"])
+        buffer = self.config[key] if key else None
+        bookable_from = self.clock.now() + timedelta(minutes=buffer) if buffer else None
+        return 200, {**view, "machine": machine["code"], "state": machine["state"],
+                     "changed_at": machine["changed_at"], "buffer_minutes": buffer,
+                     "bookable_from": hhmm(bookable_from) if bookable_from else None,
+                     "assignable": self.is_assignable(machine, self.clock.now())}
 
     # --- state machine (R6) -------------------------------------------------
 
-    def transition(self, machine_id: int, to: str, now: datetime) -> None:
-        machine = self.db.one("SELECT * FROM machines WHERE id = ?", (machine_id,))
+    def transition(self, machine_id: int, to: str, now: datetime, event: str | None = None) -> None:
+        """The only writer of a machine state: the hop must be in the table or nothing is written."""
+        machine = self.repo.machine_by_id(machine_id)
         current = machine["state"]
-        if to not in MACHINE_TRANSITIONS.get(current, set()):
-            raise InvalidTransition(current, to)
+        if not machine_states.declares(current, to):
+            raise InvalidTransition(current, to, event=event)
         self.repo.set_machine_state(machine_id, to, now)
-
-    def machine_code(self, machine_id: int) -> str:
-        row = self.db.one("SELECT code FROM machines WHERE id = ?", (machine_id,))
-        return row["code"] if row else None
 
 
 class InvalidTransition(Exception):
-    def __init__(self, current: str, to: str) -> None:
+    """A hop the table does not declare. It carries the attempted transition so 409 can name it."""
+
+    def __init__(self, current: str, to: str, event: str | None = None) -> None:
         super().__init__(f"{current} -> {to}")
         self.current = current
         self.to = to
+        self.event = event
