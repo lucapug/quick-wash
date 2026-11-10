@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "strata": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://minisforum-nucx-windows.tail60fef8.ts.net:8080/v1"
+      },
+      "models": {
+        "qwen3.8-flash-next-iq2_xs": {
+          "name": "Qwen3.8 Flash Next IQ2_XS (Strata)"
+        }
+      }
+    }
+  }
+}

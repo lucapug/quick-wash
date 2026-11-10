@@ -1,0 +1,35 @@
+# V2 anello 1: issue aperta → System 1 (Strata json_schema) → label atomic/complex.
+# La label viene applicata con FACTORY_TOKEN → l'evento "labeled" fa scattare pi-issue.
+name: route-issue
+
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  route:
+    runs-on: [self-hosted, factory]
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
+      ISSUE_BODY: ${{ github.event.issue.body }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Classifica (System 1, json_schema su Strata)
+        id: cls
+        run: python3 .github/scripts/classify.py >> "$GITHUB_OUTPUT"
+      - name: Etichetta e commenta
+        env:
+          N: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$N" --add-label "${{ steps.cls.outputs.route }}"
+          gh issue comment "$N" --body "**Routing: ${{ steps.cls.outputs.route }}** · confidenza ${{ steps.cls.outputs.confidence }} · ${{ steps.cls.outputs.reason }}
+
+          _factory V2 · override manuale: prefisso [atomic] o [complex] nel titolo_"

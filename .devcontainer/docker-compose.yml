@@ -1,0 +1,36 @@
+# Factory V1 — topologia egress fail-closed:
+#   app (agenti) ---- labnet (internal: NESSUNA route WAN) ---- gate (squid allowlist) ---- egress ---- WAN/tailnet
+# L'unico modo per uscire da app è il proxy gate: chi ignora le env proxy semplicemente non ha rete.
+services:
+  gate:
+    image: ubuntu/squid:latest
+    restart: unless-stopped
+    volumes:
+      - ./squid/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - labnet
+      - egress
+
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    command: sleep infinity
+    volumes:
+      # mount del repo: nome generico, il template funziona per qualsiasi progetto
+      - ..:/workspace:cached
+    environment:
+      # proxy MAIUSCOLI + minuscoli: Node/Go leggono entrambi, curl legge solo i minuscoli per http://
+      HTTP_PROXY: http://gate:3128
+      HTTPS_PROXY: http://gate:3128
+      NO_PROXY: localhost,127.0.0.1
+      http_proxy: http://gate:3128
+      https_proxy: http://gate:3128
+      no_proxy: localhost,127.0.0.1
+    networks:
+      - labnet
+
+networks:
+  labnet:
+    internal: true
+  egress:

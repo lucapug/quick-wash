@@ -1,0 +1,31 @@
+{
+  "name": "AI Factory Lab (egress-hardened)",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      },
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-python.python",
+        "github.vscode-github-actions"
+      ]
+    }
+  },
+  "containerEnv": {
+    "LOCAL_LLM_BASE_URL": "http://minisforum-nucx-windows.tail60fef8.ts.net:8080/v1",
+    "OPENAI_API_BASE": "http://minisforum-nucx-windows.tail60fef8.ts.net:8080/v1",
+    "NODE_USE_ENV_PROXY": "1"
+  },
+  "postCreateCommand": "sh .devcontainer/scripts/setup-executors.sh || echo 'WARN: setup esecutori fallito, vedi .devcontainer/scripts/setup-executors.sh'",
+  "remoteUser": "node"
+}

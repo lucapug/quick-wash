@@ -1,0 +1,86 @@
+# V2 anello 2: label atomic → pi implementa → PR (o retry sul ramo esistente).
+# Scatta sia dalla route sia dalla ri-accodazione dopo CHANGES_REQUESTED:
+# in retry, il feedback dell'ultima review entra nel prompt di pi.
+# Guardia anti-loop: max 3 rigetti, poi review:needs-human.
+name: pi-issue
+
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  implement:
+    if: github.event.label.name == 'atomic' && github.event.issue.state == 'open'
+    runs-on: [self-hosted, factory]
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+    env:
+      GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.FACTORY_TOKEN }}
+      - name: Prepara git e pytest
+        run: |
+          git config user.name "pi-actor"
+          git config user.email "pi-actor@factory.local"
+          python3 -m pytest --version >/dev/null 2>&1 || python3 -m pip install --break-system-packages -q pytest
+      - name: Contesto (PR esistente, tentativi, feedback)
+        id: ctx
+        env:
+          N: ${{ github.event.issue.number }}
+        run: |
+          BR="feat/issue-$N"
+          PRN="$(gh pr list --head "$BR" --json number --jq '.[0].number // empty')"
+          ATT=0; FEEDBACK=""
+          if [ -n "$PRN" ]; then
+            ATT="$(gh pr view "$PRN" --json comments --jq '[.comments[].body | select(contains("CHANGES_REQUESTED"))] | length')"
+            FEEDBACK="$(gh pr view "$PRN" --json comments --jq '[.comments[].body | select(contains("CHANGES_REQUESTED"))] | last // ""')"
+          fi
+          echo "prn=$PRN" >> "$GITHUB_OUTPUT"; echo "attempts=$ATT" >> "$GITHUB_OUTPUT"
+          printf '%s' "$FEEDBACK" > /tmp/feedback.txt
+          echo "PR=$PRN tentativi=$ATT"
+      - name: Guardia anti-loop
+        if: steps.ctx.outputs.attempts >= 3
+        env:
+          N: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$N" --add-label review:needs-human
+          echo "3 rigetti: fermo il loop, serve l'umano."
+          exit 1
+      - name: pi implementa l'issue
+        env:
+          N: ${{ github.event.issue.number }}
+          ATT: ${{ steps.ctx.outputs.attempts }}
+        run: |
+          BR="feat/issue-$N"
+          git checkout -B "$BR"
+          gh issue view "$N" --json title,body > /tmp/issue.json
+          python3 .github/scripts/build_prompt.py /tmp/issue.json > /tmp/prompt.txt
+          if [ -s /tmp/feedback.txt ]; then
+            printf '\n\nTENTATIVO %s: la review precedente ha chiesto modifiche. Feedback del reviewer:\n%s\n' "$((ATT+1))" "$(cat /tmp/feedback.txt)" >> /tmp/prompt.txt
+          fi
+          PI_BIN="$(command -v pi || echo /usr/local/share/nvm/current/bin/pi)"
+          "$PI_BIN" -p --no-session --provider strata --model qwen3.8-flash-next-iq2_xs "$(cat /tmp/prompt.txt)"
+          python3 -m pytest -q || true
+          git add -A
+          git commit -m "feat: implement issue #$N (pi-actor, tentativo $((ATT+1)))"
+          git push origin "$BR" --force
+      - name: PR o nota di retry
+        env:
+          N: ${{ github.event.issue.number }}
+          PRN: ${{ steps.ctx.outputs.prn }}
+          ATT: ${{ steps.ctx.outputs.attempts }}
+        run: |
+          BR="feat/issue-$N"
+          if [ -z "$PRN" ]; then
+            gh pr create --head "$BR" --title "feat: issue #$N" --body "PR automatica di pi per l'issue #$N. Closes #$N."
+          else
+            gh pr comment "$PRN" --body "Tentativo $((ATT+1)) di pi dopo il feedback della review."
+          fi

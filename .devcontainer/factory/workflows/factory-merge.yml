@@ -1,0 +1,27 @@
+# V2 anello 4: label review:approved → merge (la PR chiude l'issue con "Closes #N").
+name: factory-merge
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  merge:
+    if: github.event.label.name == 'review:approved'
+    runs-on: [self-hosted, factory]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Merge
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr merge "$PR_NUMBER" --merge --subject "feat: #${{ github.event.pull_request.number }} (pi-actor) — review approved, factory V2"
+          echo "PR #$PR_NUMBER mergiata: il ciclo si chiude da solo."
