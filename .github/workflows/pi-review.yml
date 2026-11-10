@@ -1,0 +1,118 @@
+# V2 anello 3: PR aperta/aggiornata → gate pytest + review indipendente (pi).
+# APPROVED → label review:approved (fa scattare factory-merge).
+# CHANGES_REQUESTED → commento con le richieste + ri-accodazione automatica
+# (toggle della label atomic sull'issue → pi-issue riparte col feedback nel prompt).
+# ADR 0005: workflow_dispatch con input pr_number — la finestra di review su Mac
+# ri-dispatcha le PR già aperte (il trigger pull_request non ri-scatta); la guardia
+# feat/issue- e il checkout dell'head sha vivono nello step Contesto PR via gh pr view.
+name: pi-review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Numero della PR da ri-revieware (finestra ADR 0005)'
+        required: true
+
+permissions: {}
+
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'feat/issue-')
+    runs-on: [self-hosted, factory]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.FACTORY_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Contesto PR
+        id: prinfo
+        env:
+          # pull_request → numero dell'evento; workflow_dispatch → input (ADR 0005:
+          # le PR già aperte non ri-scattano il trigger, la finestra le ri-dispatcha)
+          PR_NUM: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          if [ -z "$PR_NUM" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "nessun numero PR: skip"; exit 0; fi
+          ST="$(gh pr view "$PR_NUM" --json state --jq .state 2>/dev/null || true)"
+          if [ "$ST" != "OPEN" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; echo "PR non aperta ($ST): niente da fare"; exit 0; fi
+          BR="$(gh pr view "$PR_NUM" --json headRefName --jq .headRefName)"
+          case "$BR" in
+            feat/issue-*) ;;
+            *) echo "skip=true" >> "$GITHUB_OUTPUT"; echo "branch $BR non feat/issue- (guardia): skip"; exit 0 ;;
+          esac
+          SHA="$(gh pr view "$PR_NUM" --json headRefOid --jq .headRefOid)"
+          echo "number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "n=${BR#feat/issue-}" >> "$GITHUB_OUTPUT"
+          git checkout "$SHA"
+      - name: Gate test
+        id: tests
+        if: steps.prinfo.outputs.skip != 'true'
+        run: |
+          if python3 -m pytest -q; then echo "result=pass" >> "$GITHUB_OUTPUT"; else echo "result=fail" >> "$GITHUB_OUTPUT"; fi
+      - name: Tamper-check test forniti (sha256)
+        id: tamper
+        if: steps.prinfo.outputs.skip != 'true'
+        run: |
+          gh issue view "${{ steps.prinfo.outputs.n }}" --json body > /tmp/issue_tamper.json
+          if python3 .github/scripts/verify_tests.py /tmp/issue_tamper.json; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Review indipendente (GLM finestra, fallback pi)
+        id: rev
+        if: steps.prinfo.outputs.skip != 'true' && steps.tamper.outputs.result != 'fail'
+        run: |
+          git fetch origin main
+          git diff "origin/main...${{ steps.prinfo.outputs.sha }}" > /tmp/diff.txt
+          gh issue view "${{ steps.prinfo.outputs.n }}" --json title,body > /tmp/issue.json
+          python3 .github/scripts/build_review_prompt.py /tmp/issue.json /tmp/diff.txt > /tmp/review_prompt.txt
+          R=$(sh .github/scripts/reviewer_call.sh /tmp/review_prompt.txt /tmp/review_raw.txt)
+          echo "reviewer=$R" >> "$GITHUB_OUTPUT"
+          if head -1 /tmp/review_raw.txt | grep -q "VERDICT: APPROVED"; then V=APPROVED; else V=CHANGES_REQUESTED; fi
+          echo "verdict=$V" >> "$GITHUB_OUTPUT"
+      - name: Esito (commento, label, status) e ri-accodazione
+        if: steps.prinfo.outputs.skip != 'true'
+        env:
+          PR_NUMBER: ${{ steps.prinfo.outputs.number }}
+          SHA: ${{ steps.prinfo.outputs.sha }}
+          N: ${{ steps.prinfo.outputs.n }}
+        run: |
+          V="${{ steps.rev.outputs.verdict }}"; T="${{ steps.tests.outputs.result }}"; TP="${{ steps.tamper.outputs.result }}"; R="${{ steps.rev.outputs.reviewer }}"
+          VE="$V"; [ "$TP" = "fail" ] && VE="CHANGES_REQUESTED"
+          STATE=failure; LABEL="review:changes-requested"
+          if [ "$VE" = "APPROVED" ] && [ "$T" = "pass" ]; then STATE=success; LABEL="review:approved"; fi
+          {
+            echo "**Review indipendente ($R, gate pytest) — factory V2**"
+            echo
+            echo "- Verdetto: \`$VE\` · Test gate: \`$T\` · Tamper-check: \`$TP\` · Reviewer: \`$R\`"
+            echo
+            if [ -f /tmp/review_raw.txt ]; then tail -40 /tmp/review_raw.txt; else echo "(review saltata: tamper-check fallito)"; fi
+          } > /tmp/comment.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/comment.md
+          gh pr edit "$PR_NUMBER" --add-label "$LABEL"
+          gh api "repos/$GH_REPO/statuses/$SHA" -f state="$STATE" -f context="prime-review" -f description="verdict=$VE tests=$T tamper=$TP reviewer=$R" \
+            || echo "warn: commit status non postato (PAT senza permesso Commit statuses) — non fatale"
+          if [ "$VE" != "APPROVED" ]; then
+            ATT="$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[].body | select(contains("CHANGES_REQUESTED"))] | length')"
+            if [ "$ATT" -lt 3 ]; then
+              echo "ri-accodo l'issue #$N a pi (tentativo $ATT)"
+              gh issue edit "$N" --remove-label atomic
+              sleep 3
+              gh issue edit "$N" --add-label atomic
+            else
+              gh issue edit "$N" --add-label review:needs-human
+              echo "3 rigetti: issue #$N marcata review:needs-human"
+            fi
+          fi
