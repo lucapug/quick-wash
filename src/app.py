@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 
 from src import domain, machine_states, rules
 from src.clock import Clock
+from src.domain import time as start_times
 from src.config import SEED
 from src.repository import Repository, parse
 
@@ -158,7 +159,7 @@ class Application:
         types = []
         for type_key, count in inventory.items():
             tariff = domain.tariff_of(type_key, self.config)
-            starts = rules.valid_start_times(type_key, self.config, day)
+            starts = start_times.valid_start_times(day, type_key, self.config)
             usable = [start for start in starts if start >= now]
             earliest = usable[0] if usable else now
             free = [machine for machine in self.repo.machines()
@@ -253,13 +254,16 @@ class Application:
         if start is None:
             return 400, {"error": "start_required", "message": "Serve un orario di inizio"}
 
-        valid = rules.valid_start_times(type_key, self.config, start.date())
-        alternatives = [hhmm(moment) for moment in valid if moment > start]
+        # R1, R2: the pure helper decides the slot and names the reason from the fixed vocabulary
+        # (AC4), with the next valid alternatives earliest first, crossing to the next open day when
+        # the day is exhausted (AC5, AC6).
+        valid = start_times.valid_start_times(start.date(), type_key, self.config)
+        answer = start_times.next_valid_starts(start.date(), type_key, start, self.config)
         if start not in valid:
             return 409, {
                 "error": "slot_not_valid",
-                "reason": self.refusal_reason(type_key, start),
-                "alternatives": alternatives,
+                "reason": answer["reason"],
+                "alternatives": answer["alternatives"],
                 "message": "Lo slot scelto non può essere rispettato",
             }
 
@@ -280,7 +284,7 @@ class Application:
             return 409, {
                 "error": "no_machine_free",
                 "reason": "all machines of this type are committed for that slot",
-                "alternatives": [hhmm(moment) for moment in valid if moment >= now],
+                "alternatives": answer["alternatives"],
                 "message": "Nessuna macchina libera di questo tipo per lo slot scelto",
             }
 
@@ -294,7 +298,7 @@ class Application:
             return 409, {
                 "error": "slot_taken",
                 "enforced_by": "persistence layer",
-                "alternatives": [hhmm(moment) for moment in valid if moment > start],
+                "alternatives": answer["alternatives"],
                 "message": "Lo slot è stato assegnato a un altro cliente: scegli un orario alternativo",
             }
 
@@ -342,18 +346,6 @@ class Application:
             "state": booking["state"],
             "grace_window": {"from": hhmm(grace_from), "to": hhmm(grace_to)},
         }
-
-    def refusal_reason(self, type_key: str, start) -> str:
-        day = start.date()
-        if day.strftime("%A") in self.config["closed_days"]:
-            return "closed day"
-        if not self.is_inside_hours(start):
-            return "outside opening hours"
-        cycle = timedelta(minutes=domain.tariff_of(type_key, self.config).cycle_minutes)
-        close = datetime.combine(day, self._time_of(self.config["opening_hours"]["close"]))
-        if start + cycle > close:
-            return "cycle would overrun closing time"
-        return "start not on the 15-minute grid"
 
     def parse_start(self, value):
         if not value:
