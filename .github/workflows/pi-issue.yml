@@ -12,7 +12,7 @@ permissions: {}
 
 jobs:
   implement:
-    if: github.event.label.name == 'atomic' && github.event.issue.state == 'open'
+    if: (github.event.label.name == 'atomic' || github.event.label.name == 'complex') && github.event.issue.state == 'open'
     runs-on: [self-hosted, factory]
     timeout-minutes: 20
     permissions:
