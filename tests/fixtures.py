@@ -56,13 +56,21 @@ def seed(client: SeamClient) -> dict:
     """The seeded configuration and the 8-machine inventory, read back from the database."""
     counts = client.app.repo.machine_counts()
     values = client.app.repo.settings()
+    tariffs = values["tariffs"]
     return {
         "machines": sum(counts.values()),
         "types": counts,
+        # Tariff and duration are the type's, never a machine row's (issue #5, AC 2).
+        "cycle_minutes": {key: tariff["cycle_minutes"] for key, tariff in tariffs.items()},
+        "tokens_required": {key: tariff["tokens"] for key, tariff in tariffs.items()},
+        "turnover_buffer_minutes": values["turnover_buffer_minutes"],   # addendum patch 2
+        "cleaning_buffer_minutes": values["cleaning_buffer_minutes"],   # addendum patch 2
+        "grid_minutes": values["grid_minutes"],
         "opening_hours": values["opening_hours"],
         "closed_days": values["closed_days"],
-        "tariffs": values["tariffs"],
-        "buffers": {"turnover_minutes": values["turnover_minutes"], "cleaning_minutes": values["cleaning_minutes"]},
+        "tariffs": tariffs,
+        "buffers": {"turnover_minutes": values["turnover_buffer_minutes"],
+                    "cleaning_minutes": values["cleaning_buffer_minutes"]},
         "owner_email": values["owner_email"],
         "backend": client.db.backend,
     }
