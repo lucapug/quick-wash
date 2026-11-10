@@ -1,7 +1,7 @@
 """Checks on the project context files created by this issue (README.md, AGENTS.md).
 
-AGENTS.md indexes every modular doc under docs/, so the docs set here is the pack, the record and
-the agent-team specification the root index points at.
+AGENTS.md indexes every modular doc under docs/, so the docs set here is the pack, the record, the
+agent-team specification and the tracker conventions the root index points at.
 """
 import pathlib
 import re
@@ -11,6 +11,7 @@ DOCS = ROOT / "docs"
 PACK = {"docs/spec.md", "docs/addendum-firma.md"}
 RECORD = "docs/ESITO.md"
 TEAM_SPEC = "docs/agent-team-spec.md"
+TRACKER = "docs/tracker.md"
 
 POSIX_ABSOLUTE = re.compile(r"(?<![\w.'])/(?:[\w.-]+/)+")
 WINDOWS_ABSOLUTE = re.compile(r"[A-Za-z]:\\\\[\w.-]")
@@ -56,9 +57,9 @@ def test_readme_lists_only_the_pack_as_authoritative_specs():
     assert "AGENTS.md" not in table
 
 
-def test_docs_folder_contains_only_the_pack_the_record_and_the_team_spec():
+def test_docs_folder_contains_only_the_pack_the_record_the_team_spec_and_the_tracker():
     found = {f"docs/{p.name}" for p in DOCS.glob("*.md")}
-    assert found == PACK | {RECORD, TEAM_SPEC}
+    assert found == PACK | {RECORD, TEAM_SPEC, TRACKER}
 
 
 def test_agents_declares_the_pack_as_the_authoritative_layer_and_the_addendum_wins():
