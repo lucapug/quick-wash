@@ -70,7 +70,11 @@ jobs:
           "$PI_BIN" -p --no-session --provider strata --model qwen3.8-flash-next-iq2_xs "$(cat /tmp/prompt.txt)"
           python3 -m pytest -q || true
           git add -A
-          git commit -m "feat: implement issue #$N (pi-actor, tentativo $((ATT+1)))"
+          if git diff --cached --quiet; then
+            echo "niente in staging: albero già committato da pi — salto commit"
+          else
+            git commit -m "feat: implement issue #$N (pi-actor, tentativo $((ATT+1)))"
+          fi
           git push origin "$BR" --force
       - name: PR o nota di retry
         env:
