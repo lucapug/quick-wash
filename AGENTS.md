@@ -32,6 +32,7 @@ addendum overrides `docs/spec.md` on:
 - `docs/spec.md` — specification: problem, solution, user stories, machine state machine, rules R1-R11, testing seam, out of scope, open decisions.
 - `docs/addendum-firma.md` — signed addendum: the correction layer that wins on every conflict, and the operating notes for the agent team.
 - `docs/ESITO.md` — recorded outcome of the harness trial and the transfer map from the winning backlog to this repository's issues.
+- `docs/agent-team-spec.md` — agent team specification: roles and what each owns, the one-issue-in-flight process, the review protocol (GO / GO-con-note / RISUBMIT), the rubric numbers as corrected by the addendum, and the mixed model.
 
 This index lists every file under `docs/`, one line per file.
 

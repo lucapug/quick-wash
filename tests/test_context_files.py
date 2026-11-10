@@ -1,10 +1,16 @@
-"""Checks on the project context files created by this issue (README.md, AGENTS.md)."""
+"""Checks on the project context files created by this issue (README.md, AGENTS.md).
+
+AGENTS.md indexes every modular doc under docs/, so the docs set here is the pack, the record and
+the agent-team specification the root index points at.
+"""
 import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 PACK = {"docs/spec.md", "docs/addendum-firma.md"}
+RECORD = "docs/ESITO.md"
+TEAM_SPEC = "docs/agent-team-spec.md"
 
 POSIX_ABSOLUTE = re.compile(r"(?<![\w.'])/(?:[\w.-]+/)+")
 WINDOWS_ABSOLUTE = re.compile(r"[A-Za-z]:\\\\[\w.-]")
@@ -50,9 +56,9 @@ def test_readme_lists_only_the_pack_as_authoritative_specs():
     assert "AGENTS.md" not in table
 
 
-def test_docs_folder_contains_only_the_pack_and_the_record():
+def test_docs_folder_contains_only_the_pack_the_record_and_the_team_spec():
     found = {f"docs/{p.name}" for p in DOCS.glob("*.md")}
-    assert found == PACK | {"docs/ESITO.md"}
+    assert found == PACK | {RECORD, TEAM_SPEC}
 
 
 def test_agents_declares_the_pack_as_the_authoritative_layer_and_the_addendum_wins():
@@ -74,6 +80,7 @@ def test_agents_indexes_every_modular_doc_under_docs():
     for path in sorted(DOCS.glob("*.md")):
         assert f"`docs/{path.name}`" in index
     assert "AGENTS.md" not in index
+    assert f"`{TEAM_SPEC}`" in index
 
 
 def test_index_lines_are_repo_relative_and_point_at_real_files():
@@ -85,7 +92,7 @@ def test_index_lines_are_repo_relative_and_point_at_real_files():
 
 
 def test_context_files_have_no_host_paths_and_no_secrets():
-    for name in ("README.md", "AGENTS.md"):
+    for name in ("README.md", "AGENTS.md", TEAM_SPEC):
         text = read(name)
         assert not POSIX_ABSOLUTE.search(text), name
         assert not WINDOWS_ABSOLUTE.search(text), name
