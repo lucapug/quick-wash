@@ -6,7 +6,9 @@ ephemeral port, so a test drives the real HTTP boundary without anyone starting 
 
 Telemetry here is the request line only: no body, no customer email, no unlock code, no one-time
 code (docs/spec.md, Observability shape). The query parameters of the public read (`window_hours`,
-`type`) join the body of the call, and the logged line is the path without them.
+`type`) join the body of the call, and the logged line is the path without them. The line itself is
+written by `src/telemetry.py`, because that is where the credential guard lives: a line that would
+carry a credential is refused before it is stored or printed, so nothing here can log one.
 """
 
 import json
@@ -38,8 +40,8 @@ def make_handler(app: Application):
             self.end_headers()
             self.wfile.write(raw)
 
-        def log_message(self, format, *args):  # request line only, never the body
-            print(f"{self.address_string()} {self.command} {self.path.split('?')[0]}")
+        def log_message(self, format, *args):  # the structured line is the log, and the recorder writes it
+            pass
 
     return SeamHandler
 

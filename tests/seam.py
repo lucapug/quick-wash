@@ -54,10 +54,15 @@ class SeamClient:
         return self._request("POST", path, payload if payload is not None else json, headers)
 
     def session(self, email: str) -> Session:
-        """Sign in as `email`: request the code (shown in-app), then verify it once."""
+        """Sign in as `email`: ask for the code (shown in-app), then redeem it once for the token.
+
+        The two steps are the two identity paths: `POST /api/session` takes the email only, and the code
+        it showed is redeemed on `POST /api/session/verify` — the only thing that mints a session, which
+        is why a caller that has not gone through it is not a customer (issue #9, AC7).
+        """
         request = self.post("/api/session", {"email": email})
         otp = request.json()["otp"]
-        verified = self.post("/api/session", {"email": email, "code": otp})
+        verified = self.post("/api/session/verify", {"email": email, "otp": otp})
         payload = verified.json()
         if verified.status_code != 200 or not payload.get("token"):
             raise AssertionError(f"sign-in failed for {email}: {verified.text}")

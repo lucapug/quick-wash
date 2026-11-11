@@ -6,11 +6,20 @@ answers with the alternatives.
 
 Machine rows store id, code, type, state, changed_at — no price, no duration, no venue: the tariff
 and the cycle length are read through the type registry in src/domain.py.
+
+The identity tables are the ones this layer owns, and their shape is part of AC1: `identities` holds the
+email and the owner flag and nothing else — there is no password column in any table, because there is
+no password in the product. `otp` holds the *hash* of the one-time code with its expiry and the moment it
+was spent, so a plaintext credential is never readable back out of the database: single-use and expiry
+are facts of the row, which is what the tests assert through the seam. `sessions` holds the opaque token
+the customer is recognised by on the next visit (US19), so the token is stored as given and never
+reconstructed from the email.
 """
 
 import json
 from datetime import datetime
 
+from src import identity
 from src.config import SEED
 
 TABLES = {
@@ -20,8 +29,10 @@ TABLES = {
         "id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, is_owner INTEGER NOT NULL DEFAULT 0",
     ),
     "otp": (
-        "id INTEGER PRIMARY KEY, email TEXT NOT NULL, code TEXT NOT NULL, created_at TEXT NOT NULL",
-        "id SERIAL PRIMARY KEY, email TEXT NOT NULL, code TEXT NOT NULL, created_at TEXT NOT NULL",
+        "id INTEGER PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "expires_at TEXT NOT NULL, used_at TEXT",
+        "id SERIAL PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "expires_at TEXT NOT NULL, used_at TEXT",
     ),
     "sessions": (
         "token TEXT PRIMARY KEY, email TEXT NOT NULL, created_at TEXT NOT NULL",
@@ -177,16 +188,31 @@ class Repository:
         self.db.execute("INSERT INTO identities (email, is_owner) VALUES (?, ?)", (email, 1 if is_owner else 0))
         return self.db.one("SELECT * FROM identities WHERE email = ?", (email,))
 
-    def issue_otp(self, email: str, now: datetime, code: str) -> None:
-        self.db.execute("DELETE FROM otp WHERE email = ?", (email,))
-        self.db.execute("INSERT INTO otp (email, code, created_at) VALUES (?, ?, ?)", (email, code, iso(now)))
+    def issue_otp(self, email: str, code_hash: str, created: datetime, expires: datetime) -> dict:
+        """Store the hashed code with its expiry. One live code per identity: the previous one is gone.
 
-    def current_otp(self, email: str) -> str | None:
-        row = self.db.one("SELECT code FROM otp WHERE email = ? ORDER BY id DESC", (email,))
-        return row["code"] if row else None
+        The plaintext code is never passed in, so it is never stored and never readable back: the row is
+        the fact the tests assert (single-use, expiry), not a copy of a credential.
+        """
+        self.db.execute("DELETE FROM otp WHERE email = ?", (email,))
+        self.db.execute(
+            "INSERT INTO otp (email, code_hash, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (email, code_hash, iso(created), iso(expires)),
+        )
+        return self.db.one("SELECT * FROM otp WHERE email = ? ORDER BY id DESC", (email,))
+
+    def find_otp(self, email: str, code_hash: str) -> dict | None:
+        """Look a code up by its hash: the only way a code can be matched here."""
+        return self.db.one("SELECT * FROM otp WHERE email = ? AND code_hash = ? ORDER BY id DESC",
+                           (email, code_hash))
+
+    def mark_otp_used(self, otp_id: int, now: datetime) -> None:
+        """AC4: the first verify is the only one. The row is spent from this moment."""
+        self.db.execute("UPDATE otp SET used_at = ? WHERE id = ?", (iso(now), otp_id))
 
     def create_session(self, email: str, now: datetime) -> str:
-        token = f"tok-{email.replace('@', '-').replace('.', '-')}-{iso(now)}"
+        """The persisted session token (US19): opaque, stored as given, never built from the email."""
+        token = identity.new_token()
         self.db.execute("INSERT INTO sessions (token, email, created_at) VALUES (?, ?, ?)", (token, email, iso(now)))
         return token
 

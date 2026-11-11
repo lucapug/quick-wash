@@ -20,16 +20,25 @@ the board and the window cannot drift.
 
 Keys are English, user-facing copy is Italian. Nothing here logs a customer email, an unlock code
 or a one-time code.
+
+The identity layer (issue #9): `POST /api/session` takes the email only and shows the one-time code
+in-app (addendum patch 1), `POST /api/session/verify` redeems it for the persisted session token, and
+the code is stored hashed with its expiry so single-use and expiry are facts of the row (AC4). AC7 is
+the gate this module enforces: no booking is created for a caller without a session, so the anonymous
+caller is no longer a customer that can book — it is the reviewer's observer, and it keeps its reads.
+The telemetry read is the reviewer's view of the request lines; the recorder itself (`src/telemetry.py`)
+is what keeps a credential out of them (AC3).
 """
 
-import hashlib
 from datetime import datetime, timedelta
 
 from src import availability, domain, machine_states, rules
+from src import identity as credentials
 from src.clock import Clock
 from src.domain import time as start_times
 from src.config import SEED
 from src.repository import Repository, parse
+from src.telemetry import Telemetry
 
 ROUTES = {
     ("POST", "/api/session"): "session",
@@ -54,13 +63,20 @@ SEED_WRITE = {"POST /api/machines": "create_machine"}
 # machine state and it consults that table for every hop.
 PER_MACHINE_READ = ("GET", "/api/machines/")
 
-# Demo mode (addendum patch 1): nothing leaves the machine and the one-time code is shown in-app, so
-# the reviewer's session has no token. An unauthenticated caller is the demo identity: it can book and
-# it can read the state of a single machine, which is what AC 8 asks for — a reviewer watching the
-# transitions live without signing in. A signed-in customer keeps its entitlements: the owner board and
-# the incident list stay closed to customers (tests/test_journey.py), and the fallback happens only
-# when there is no token at all, never for a token that does not resolve.
-DEMO_IDENTITY = {"email": "demo@quickwash.local", "is_owner": 0, "is_demo": True}
+# Three reads are patterns, not contract paths, so `ROUTES` stays exactly the eight entries
+# tests/test_seam.py pins: the state of one machine (issue #6, AC8), the verification of a one-time
+# code, and the telemetry read. The contract fixes the sign-in request; the code it showed in-app is
+# redeemed on its sub-path, and the log lines are read on theirs.
+PATTERNS = {"POST /api/session/verify": "verify", "GET /api/logs/recent": "logs"}
+
+# The reviewer's observer (issue #6, AC8): a caller with no session can still watch the shop live — the
+# public availability view, the state of one machine, the incident list. It is not an identity, and that
+# is AC7 of this issue: a booking needs a session, and the only thing that mints one is the verification
+# of a one-time code. The observer has no bookings of its own, so it has no customer entitlements to
+# lose, and it carries no email — the incident list answered to it is the one with no customer in it.
+# A signed-in customer keeps its entitlements the other way round: the owner board and the incident list
+# stay closed to customers (tests/test_journey.py).
+OBSERVER = {"email": None, "is_owner": 0, "is_observer": True}
 
 
 def hhmm(moment: datetime) -> str:
@@ -74,6 +90,8 @@ class Application:
         self.repo = Repository(db, config)
         self.repo.reset()
         self.config = self.repo.settings()
+        self.telemetry = Telemetry(clock=self.clock)
+        self.journey = None  # the journey the request being handled belongs to (shared trace id)
 
     # --- seam ---------------------------------------------------------------
 
@@ -81,13 +99,17 @@ class Application:
                headers: dict | None = None) -> tuple[int, dict]:
         name = (ROUTES.get((method, path)) or SEED_WRITE.get(f"{method} {path}")
                 or self.pattern_route(method, path))
+        # The journey this request belongs to, resolved by the handler: the trace identifier is shared by
+        # every log line and every metric attached to that journey (docs/spec.md, Observability shape).
+        self.journey = None
         if name is None:
+            self.telemetry.record(method, path, 404)
             return 404, {"error": "not_found", "message": f"Percorso sconosciuto: {path}"}
         # R10 and AC 3: the two buffer hops are carried by time, not by a caller, so a request
         # resolves the elapsed buffers before answering. That is what makes the state read a live read.
         self.resolve_buffers(self.clock.now())
         try:
-            return getattr(self, f"handle_{name}")(body or {}, headers or {}, path)
+            status, payload = getattr(self, f"handle_{name}")(body or {}, headers or {}, path)
         except InvalidTransition as bad:
             # R6: invalid transitions are rejected, never silently coerced. The attempted hop is in
             # the body, and the machine keeps the state the table had declared for it.
@@ -97,10 +119,18 @@ class Application:
                        "message": f"Transizione non valida: {bad.current} -> {bad.to}"}
             if bad.event:
                 payload["event"] = bad.event
+            self.telemetry.record(method, path, 409, event=name)
             return 409, payload
+        # The request line is all telemetry sees here: the path without its query, the status, the name of
+        # the handler and the journey. Never the body, which is where a credential arrives (AC3).
+        self.telemetry.record(method, path, status, event=name, journey=self.journey)
+        return status, payload
 
     def pattern_route(self, method: str, path: str) -> str | None:
-        """The per-machine read (AC 8): a pattern, not a ninth contract path."""
+        """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs."""
+        name = PATTERNS.get(f"{method} {path}")
+        if name:
+            return name
         if method == PER_MACHINE_READ[0] and path.startswith(PER_MACHINE_READ[1]):
             return "machine"
         return None
@@ -115,46 +145,112 @@ class Application:
             if now - parse(machine["changed_at"]) >= timedelta(minutes=self.config[key]):
                 self.transition(machine["id"], "available", now)
 
-    # --- identity -----------------------------------------------------------
+    # --- identity (issue #9) -------------------------------------------------
 
     def handle_session(self, body, headers, path=None):
+        """AC1, AC2: the sign-in request takes the email only, and the code is the answer.
+
+        There is no password field to read, so any other name in the body is refused rather than
+        tolerated — that is what makes "no password exists in the API" a fact a test can check, and not
+        a field that is quietly ignored. The code is generated here, hashed for storage, and surfaced in
+        the response: patch 1 of the addendum makes in-app display the only delivery channel, so there
+        is no transport to write the code to. It is never echoed back in a refusal (AC3).
+        """
+        extra = credentials.unexpected(body, credentials.SIGN_IN_FIELDS)
+        if extra:
+            return 400, {"error": "field_not_allowed", "fields": extra,
+                         "message": "Il sign-in accetta solo l'email: non c'è una password da recuperare"}
         email = body.get("email")
         if not email:
             return 400, {"error": "email_required", "message": "Serve un'email per entrare"}
-        identity = self.repo.get_or_create_identity(email, email == self.config["owner_email"])
+        who = self.repo.get_or_create_identity(email, email == self.config["owner_email"])
         now = self.clock.now()
+        code = credentials.new_otp()
+        row = self.repo.issue_otp(email, credentials.hash_code(code), now, credentials.expires_at(now, self.config))
+        return 200, {
+            "email": email,
+            "otp": code,
+            "displayed_in_app": bool(self.config["otp_displayed_in_app"]),
+            "expires_in_minutes": credentials.ttl_minutes(self.config),
+            "is_owner": bool(who["is_owner"]),
+            "token": None,
+            "message": "Codice mostrato in-app: nessun'email, nessun SMS",
+        }
 
-        if body.get("code") is None:
-            # Patch 1 of the addendum: the code is shown in-app, no email or SMS transport.
-            otp = f"{int(hashlib.sha256(email.encode()).hexdigest()[:6], 16) % 1000000:06d}"
-            self.repo.issue_otp(email, now, otp)
-            return 201, {
-                "email": email,
-                "otp": otp,
-                "displayed_in_app": bool(self.config["otp_displayed_in_app"]),
-                "token": None,
-                "message": "Codice mostrato in-app: nessun'email, nessun SMS",
-            }
+    def handle_verify(self, body, headers, path=None):
+        """AC4, AC5: the code is redeemed once, inside its 10 minutes, for the persisted session token.
 
-        if body.get("code") != self.repo.current_otp(email):
-            return 401, {"error": "invalid_code", "message": "Codice non valido"}
+        The four outcomes are: the code matches and is granted; the code is spent; the code is expired;
+        the code does not match. All three refusals are 401 and none of them repeats the code — the code
+        is a credential, and an error message that echoes it is a leak (AC3).
+        """
+        extra = credentials.unexpected(body, credentials.VERIFY_FIELDS)
+        if extra:
+            return 400, {"error": "field_not_allowed", "fields": extra,
+                         "message": "La verifica accetta l'email e il codice: non c'è una password"}
+        email, code = body.get("email"), body.get("otp")
+        if not email or not code:
+            return 400, {"error": "email_and_code_required", "message": "Serve l'email e il codice mostrato in-app"}
+        row = self.repo.find_otp(email, credentials.hash_code(code))
+        if row is None:
+            return 401, {"error": "code_not_valid", "message": "Codice non valido: chiede un nuovo codice"}
+        now = self.clock.now()
+        if credentials.is_spent(row):
+            return 401, {"error": "code_already_used", "message": "Il codice è già stato usato: chiede un nuovo codice"}
+        if credentials.is_expired(parse(row["expires_at"]), now):
+            return 401, {"error": "code_expired", "ttl_minutes": credentials.ttl_minutes(self.config),
+                         "message": "Il codice è scaduto: chiede un nuovo codice"}
+        self.repo.mark_otp_used(row["id"], now)
+        who = self.repo.get_or_create_identity(email, email == self.config["owner_email"])
         token = self.repo.create_session(email, now)
-        return 200, {"email": email, "token": token, "is_owner": bool(identity["is_owner"])}
+        return 200, {"email": email, "token": token, "is_owner": bool(who["is_owner"]),
+                      "session_persisted": True,
+                      "message": "Entra: il token resta e ti riconosce alla prossima visita"}
 
-    def identity(self, headers) -> dict | None:
+    def handle_logs(self, body, headers, path=None):
+        """AC3: the telemetry read, and the reason it is safe to answer without a session.
+
+        The recorder never takes a request body, so what this read can show is the request line, the
+        trace identifier and the metric. A credential has no path into it: it is refused at the guard in
+        `src/telemetry.py`, before anything is stored or printed.
+        """
+        return 200, self.telemetry.view()
+
+    def trace(self, booking) -> str | None:
+        """The journey the request belongs to (docs/spec.md, Observability shape): the internal booking
+        id, never the customer and never a code. `src/telemetry.py` turns it into the trace identifier
+        shared by every log line and every metric attached to that journey.
+        """
+        if booking is None:
+            return None
+        self.journey = self.telemetry.journey(booking["id"])
+        return self.journey
+
+    def who_is_asking(self, headers) -> dict:
+        """Who the seam is answering: a customer with a session, or the observer without one.
+
+        AC7 lives here. The token is what makes a caller a customer, and the only thing that mints one is
+        the verification of a code; the persisted session is what recognises the same customer on the next
+        visit (US19). A caller with no token at all is the reviewer watching the shop live (issue #6,
+        AC8): it keeps its reads and loses the right to book. A token that does not resolve is nobody.
+        """
         token = (headers or {}).get("Authorization", "").removeprefix("Bearer ")
         if not token:
-            # No token at all is the demo reviewer, not a signed-in customer (see DEMO_IDENTITY).
-            return dict(DEMO_IDENTITY)
+            return dict(OBSERVER)
         session = self.repo.session_owner(token)
         if session is None:
             return None
         return self.repo.get_or_create_identity(session["email"], session["email"] == self.config["owner_email"])
 
+    def customer(self, headers) -> dict | None:
+        """A caller that can act as a customer: the observer cannot book, because it has no session."""
+        who = self.who_is_asking(headers)
+        return None if who is None or who.get("is_observer") else who
+
     def may_observe(self, who) -> bool:
-        """A signed-in customer never reads the owner panel. The demo reviewer has no session to
-        begin with, and AC 8 asks for that reviewer to watch the state machine live."""
-        return who is None or bool(who.get("is_demo")) or bool(who.get("is_owner"))
+        """A signed-in customer never reads the owner panel. The observer has no session to begin with,
+        and AC 8 asks for that reviewer to watch the state machine live."""
+        return who is None or bool(who.get("is_observer")) or bool(who.get("is_owner"))
     # --- availability (public, US8) ----------------------------------------
 
     def handle_availability(self, body, headers, path=None):
@@ -249,13 +345,20 @@ class Application:
     # --- booking ------------------------------------------------------------
 
     def handle_booking(self, body, headers, path=None):
-        who = self.identity(headers)
+        """AC7: a booking request without a session is refused here, before anything is decided.
+
+        The observer has no session, so it has no identity to attach a booking to — and R9 needs an
+        identity, because a reservation in an unattended shop is only enforceable if it belongs to
+        somebody who can be held to it.
+        """
+        who = self.customer(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice per prenotare"}
         now = self.clock.now()
 
         blocked = rules.no_show_block(self.repo.no_shows(who["email"]), now.date(), self.config)
         if blocked:
+            self.telemetry.count("customer_blocked_total", journey=self.journey)
             return 403, {
                 "error": "blocked",
                 "until": blocked.isoformat(),
@@ -320,6 +423,7 @@ class Application:
                 "message": "Lo slot è stato assegnato a un altro cliente: scegli un orario alternativo",
             }
 
+        self.trace(booking)
         self.assign(machine, now)
         view = self.booking_view(booking, machine["code"])
         # The booking is the payload, and `booking` is the same object under its key: the response can
@@ -327,7 +431,10 @@ class Application:
         return 201, {**view, "booking": view}
 
     def handle_bookings(self, body, headers, path=None):
-        who = self.identity(headers)
+        """AC5: on the return visit the customer is recognised by the persisted token and reads only
+        their own bookings — the list is filtered by the identity the token resolves to.
+        """
+        who = self.customer(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
         now = self.clock.now()
@@ -387,6 +494,7 @@ class Application:
         start = parse(booking["start_time"])
         grace_from, grace_to = rules.grace_window(start, self.config)
         machine = self.repo.machine_by_id(booking["machine_id"])
+        self.trace(booking)
 
         if booking["state"] == "confirmed" and now < grace_from:
             # R3: the code does not work before the window, so this attempt is refused and the code is
@@ -433,6 +541,7 @@ class Application:
         if booking is None:
             # A device report is about a machine: the booking it belongs to is the one still attached.
             booking = self.repo.open_booking(machine["id"])
+        self.trace(booking)
 
         # The two reports that name a customer are entitlement-gated (R7).
         if event == "fault":
@@ -471,6 +580,7 @@ class Application:
         no-show (R9) and records the incident."""
         if booking is None:
             return 404, {"outcome": "unknown_code", "message": "Nessuna prenotazione aperta su questa macchina"}
+        self.trace(booking)
         if machine["state"] != "unlocked":
             raise InvalidTransition(machine["state"], "available", event="idle_open")
         opened = parse(booking["redeemed_at"]) if booking["redeemed_at"] else None
@@ -488,7 +598,7 @@ class Application:
                      "message": "Turno perso: macchina liberata"}
 
     def handle_fault(self, body, headers, now, path=None):
-        who = self.identity(headers)
+        who = self.customer(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
         machine = self.repo.machine(body.get("machine", ""))
@@ -524,7 +634,7 @@ class Application:
                      "cancelled": cancelled, "message": "Macchina messa fuori servizio"}
 
     def handle_occupied(self, body, headers, now, path=None):
-        who = self.identity(headers)
+        who = self.customer(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
         machine = self.repo.machine(body.get("machine", ""))
@@ -578,7 +688,7 @@ class Application:
     # --- owner panel ---------------------------------------------------------
 
     def handle_machines(self, body, headers, path=None):
-        who = self.identity(headers)
+        who = self.who_is_asking(headers)
         if who is None or not who["is_owner"]:
             return 403, {"error": "owner_only", "message": "Il pannello proprietario è riservato al proprietario"}
         board = []
@@ -591,12 +701,12 @@ class Application:
         return 200, {"machines": board}
 
     def handle_incidents(self, body, headers, path=None):
-        who = self.identity(headers)
+        who = self.who_is_asking(headers)
         if not self.may_observe(who):
             return 403, {"error": "owner_only", "message": "Il pannello proprietario è riservato al proprietario"}
         # The response is the list itself: the incident list is what a reviewer reads to see what the
         # shop suffered. A signed-in customer still cannot read it, and an observer sees no customer.
-        return 200, [self.incident_view(row, observer=who is None or bool(who.get("is_demo")))
+        return 200, [self.incident_view(row, observer=bool((who or {}).get("is_observer")))
                      for row in self.repo.incidents()]
 
     def incident_view(self, row, observer: bool = False) -> dict:

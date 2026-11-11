@@ -50,8 +50,12 @@ def test_the_window_is_public_and_never_names_a_machine_a_customer_or_a_code(cli
 # --- AC7: a machine inside its turnover buffer is not counted as free -------------------------
 
 def test_a_machine_inside_its_turnover_buffer_is_not_counted_free_and_carries_its_reason(client, seed):
-    first = booked(client, "quick", "10:00")
-    second = booked(client, "quick", "10:00")          # the second machine of the type
+    # AC7 (issue #9): the walk-in can read the window without a session, but a booking needs one — the
+    # booking is what R9 has to hold somebody to.
+    ada = client.session("ada@example.com")
+    bruno = client.session("bruno@example.com")
+    first = booked(client, "quick", "10:00", ada.headers)
+    second = booked(client, "quick", "10:00", bruno.headers)          # the second machine of the type
     assert first["machine"] != second["machine"]
 
     # The journey, driven as a device drives it: redeem, cycle started, cycle finished.
