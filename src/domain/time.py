@@ -18,6 +18,10 @@ vocabulary, because such a request is adjusted rather than refused for one of th
 
 Pure: inputs and outputs are data. No repository, no clock object, no mock
 (tests/unit/test_start_times.py, docs/spec.md Testing Decisions).
+
+`DEFAULT_ALTERNATIVES` is the bounded count of the refusal answer (issue #11 slice c, AC2): 3, the number
+the UI in issue #22 renders and the number a test can assert without depending on the load of the shop.
+`src/availability.MAX_ALTERNATIVES` reads it from here, so the helper and the seam answer the same count.
 """
 
 from datetime import date, datetime, timedelta
@@ -32,7 +36,9 @@ GRID_REASON = "off_grid"
 
 # How far the answer looks for alternatives: enough to cross a closed day, not a calendar.
 LOOKAHEAD_DAYS = 14
-DEFAULT_ALTERNATIVES = 8
+# The bounded count of the refusal answer (issue #11 slice c, AC2): three is what the UI in issue #22
+# renders and what a test can assert without depending on the load of the shop.
+DEFAULT_ALTERNATIVES = 3
 
 
 def hhmm(moment: datetime) -> str:

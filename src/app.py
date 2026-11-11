@@ -51,6 +51,16 @@ handler runs: 401 for a caller with no session, 403 for a session that is not th
 enforcement at the seam, not a control the front-end hides — a customer who already holds the machine
 code or the booking id is refused on the panel path exactly as on the customer path, and a refusal
 writes nothing.
+
+The refusal answer when the race is lost (issue #11 slice c): the 409 for `no_machine_free` and
+`slot_taken` lists at most 3 alternatives (the Decision), earliest first, from the same type, on the grid
+of slice a, and only slots that are actually bookable — `src/availability.py` is the single source for
+that, so the refusal and the window answer from the same predicates. Each entry is `start`, `type` and the
+`bookable` flag the UI in issue #22 renders; the count is bounded by the customer's own R11 allowance as
+well as by 3, and by the number of machines of the type that can each give one slot, because a refusal
+that names a slot it would then refuse is not a polite refusal. The calendar refusal keeps the shape the
+test of slice a pins (`tests/integration/test_refused_starts_are_named_at_the_seam.py` reads alternatives
+as slots), so the two refusal kinds answer differently, and that is recorded rather than smoothed over.
 """
 
 from datetime import datetime, timedelta
@@ -442,6 +452,11 @@ class Application:
         """
         return availability.free_at(machine, start, self.config, availability.taken_turns(self.repo, [machine]))
 
+    def type_rows(self, type_key: str) -> list:
+        """The machines of the type, as the layer has them. The refusal answer is about the type, never
+        about one machine (issue #8, AC2), so this is the row set the predicates are read against."""
+        return [row for row in self.repo.machines() if row["type"] == type_key]
+
     def pick_machine(self, type_key: str, start) -> dict | None:
         """First machine of the type that can actually be assigned for `start`."""
         for machine in self.repo.candidate_machines(type_key):
@@ -454,6 +469,24 @@ class Application:
         if machine["state"] != "available":
             self.transition(machine["id"], "available", now)
         self.transition(machine["id"], "reserved", now)
+
+    def refusal_alternatives(self, type_key: str, requested, taken, remaining: int) -> list:
+        """US16: the polite refusal, as the answer the customer can act on (issue #11, AC1-AC3).
+
+        At most `availability.MAX_ALTERNATIVES` slots — the Decision of slice c — the earliest first,
+        from the same type, on the grid the pure helper established (slice a), and only points that are
+        actually bookable: a machine of the type free at that point, not in `maintenance`, not inside a
+        buffer, and inside the customer's own R11 allowance. A slot the seam would refuse is never
+        listed, so what the answer names is what the UI in issue #22 can offer as a tap.
+        """
+        tariff = domain.tariff_of(type_key, self.config)
+        return [{"start": start_times.slot(point, requested.date()),
+                 "type": type_key,
+                 "bookable": bookable,
+                 "cycle_minutes": tariff.cycle_minutes,
+                 "tokens_required": tariff.tokens_required}
+                for point, bookable in availability.bookable_slots(type_key, self.type_rows(type_key),
+                                                                   self.config, requested, taken, remaining)]
 
     # --- booking ------------------------------------------------------------
 
@@ -518,7 +551,9 @@ class Application:
             return 409, {
                 "error": "no_machine_free",
                 "reason": "all machines of this type are committed for that slot",
-                "alternatives": answer["alternatives"],
+                "alternatives": self.refusal_alternatives(type_key, start,
+                                                          availability.taken_turns(self.repo, self.type_rows(type_key)),
+                                                          limit - used),
                 "message": "Nessuna macchina libera di questo tipo per lo slot scelto",
             }
 
@@ -528,11 +563,15 @@ class Application:
             self.repo.next_code(now), tariff["tokens"], now,
         )
         if booking is None:
-            # R5: the persistence layer refused the slot, not a pre-check.
+            # R5: the persistence layer refused the slot, not a pre-check. This is the shape the loser
+            # of the race gets: the bounded list of slots the same type can actually honour (issue #11
+            # slice c), the earliest first, and every one of them bookable.
             return 409, {
                 "error": "slot_taken",
                 "enforced_by": "persistence layer",
-                "alternatives": answer["alternatives"],
+                "alternatives": self.refusal_alternatives(type_key, start,
+                                                          availability.taken_turns(self.repo, self.type_rows(type_key)),
+                                                          limit - used),
                 "message": "Lo slot è stato assegnato a un altro cliente: scegli un orario alternativo",
             }
 

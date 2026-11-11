@@ -35,11 +35,18 @@ The rules the window pins, stated here so the code and the reviewer read the sam
    decision of this issue): R1 makes duration type-specific, so one generic cap would name the wrong
    reason for a `family` cycle at 21:00. The calendar causes are read first (closed day, outside opening
    hours, overrun), then the machine causes.
+5. The fixed vocabulary of AC5 is `REASONS`: the three calendar words are `src.domain.time.REFUSAL_REASONS`
+   and the four machine words are the state half. No other word is answered. Nothing here logs or returns a
+   customer email, an unlock code or a customer identifier, and the telemetry line stays the request path
+   without the query.
 
-The fixed vocabulary of AC5 is `REASONS`: the three calendar words are `src.domain.time.REFUSAL_REASONS`
-and the four machine words are the state half. No other word is answered. Nothing here logs or returns a
-customer email, an unlock code or a customer identifier, and the telemetry line stays the request path
-without the query.
+The refusal answer for a slot the type cannot give (`bookable_slots`, issue #11 slice c) uses the same
+predicates, so the polite refusal and the window cannot disagree: at most `MAX_ALTERNATIVES` slots (3, the
+Decision), earliest first, from the same type, on the grid, and only points a machine of that type is
+actually free for — one point per machine, because a machine holds one turn, and bounded by the customer's
+remaining allowance for the day (R11), because a slot the customer cannot take is not an alternative. When
+nothing is bookable the answer names the points the window offers and marks them `bookable: false` rather
+than answering with an empty list, which is what `tests/test_journey.py` asserts for the loser of the race.
 """
 
 from datetime import datetime, timedelta
@@ -54,6 +61,10 @@ REASONS = ("all_machines_busy", "machine_in_maintenance", "would_overrun_closing
            "outside_opening_hours", "turnover_buffer", "cleaning_buffer")
 
 DEFAULT_WINDOW_HOURS = 4
+
+# Issue #11 slice c, AC2: the bounded count of the refusal answer, the same number the pure helper
+# answers with — one Decision, one source, so the seam and the helper cannot drift.
+MAX_ALTERNATIVES = start_times.DEFAULT_ALTERNATIVES
 
 # The two buffer reasons, read from the seed numbers (addendum patch 2: 10 and 30 minutes).
 BUFFER_REASON = {"turnover_buffer_minutes": "turnover_buffer", "cleaning_buffer_minutes": "cleaning_buffer"}
@@ -107,7 +118,16 @@ def free_at(machine, moment, config, taken) -> bool:
     if inside_buffer(machine, moment, config) is not None:
         return False
     if machine["state"] not in OPEN_STATES:
-        return False
+        # Held for a turn it still owes: not free for that point, and not free for a later one until
+        # that cycle has run and the turnover buffer has elapsed (US32, R10). The refusal only lists
+        # slots the shop can actually honour, so a listed alternative is a point this same predicate
+        # would then accept.
+        points = taken.get(machine["id"], set())
+        if not points:
+            return False
+        cycle = timedelta(minutes=domain.tariff_of(machine["type"], config).cycle_minutes)
+        buffer = timedelta(minutes=config["turnover_buffer_minutes"])
+        return moment >= max(points) + cycle + buffer
     return moment not in taken.get(machine["id"], set())
 
 
@@ -119,6 +139,9 @@ def machine_cause(machine, moment, config, taken) -> str | None:
     if hop is not None:
         return BUFFER_REASON[hop]
     if moment in taken.get(machine["id"], set()):
+        return "all_machines_busy"
+    if not free_at(machine, moment, config, taken):
+        # Held for a turn that has not run yet: the point is busy, and the phrase is the type-level one.
         return "all_machines_busy"
     return None
 
@@ -179,6 +202,55 @@ def slot_grid(type_key: str, rows, config, now, hours, taken) -> list:
     refused = [point for point in points if reasons[point] is not None]
     return [{"start": hhmm(point), "available": reasons[point] is None, "reason": reasons[point]}
             for point in offered + refused]
+
+
+def earliest_point(machine, type_key: str, config: dict, requested, taken):
+    """The earliest point strictly after `requested` at which this machine could serve a turn."""
+    for step in range(start_times.LOOKAHEAD_DAYS):
+        for point in start_times.valid_start_times(requested.date() + timedelta(days=step), type_key, config):
+            if point > requested and free_at(machine, point, config, taken):
+                return point
+    return None
+
+
+def bookable_slots(type_key: str, rows, config: dict, requested, taken,
+                   remaining: int | None = None, limit: int = MAX_ALTERNATIVES) -> list:
+    """The refusal answer for a slot the type cannot give: the alternatives it can (issue #11, AC1-AC3).
+
+    Three conditions, in order:
+
+    1. the point is a valid start for the type (R1, R2) — `src/domain/time.py` is the single source for
+       that, so the grid, the opening hours and the closed day cannot drift, and the answer crosses to
+       the next open day the way the pure helper does;
+    2. the point is one a machine of the same type is actually free for — not in `maintenance` (US42), not
+       inside a buffer (R10), not already owed to a customer (AC2). A point that is valid on the calendar
+       but has no machine free for it is not an alternative, so it is not listed;
+    3. a machine holds one turn, so a list of k alternatives is honest only when k machines can each serve
+       one of them: the answer takes the earliest point each machine that can give one can give, and the
+       count is `min(MAX_ALTERNATIVES, remaining, givers)` — 3 is the ceiling of the Decision, R11 is the
+       part of it the customer still has.
+
+    When every machine of the type is committed for the slot there is no point with a machine free for it,
+    and that is the case `tests/test_journey.py` pins as "the loser is answered with alternatives": the
+    answer then names the earliest points the type offers on the calendar and marks them
+    `bookable: false` instead of answering with an empty list. Earliest first (AC1), strictly later than
+    the refused point.
+    """
+    cap = MAX_ALTERNATIVES if remaining is None else min(MAX_ALTERNATIVES, remaining)
+    if cap <= 0:
+        return []
+    givers = [earliest_point(machine, type_key, config, requested, taken) for machine in rows]
+    givers = [point for point in givers if point is not None]
+    if givers:
+        return [(point, True) for point in sorted(set(givers))[:min(cap, len(givers))]]
+    offered = []
+    for step in range(start_times.LOOKAHEAD_DAYS):
+        for point in start_times.valid_start_times(requested.date() + timedelta(days=step), type_key, config):
+            if point > requested and point_reason(type_key, rows, point, config, taken) is None:
+                offered.append((point, False))
+        if offered:
+            break
+    return offered[:cap]
 
 
 def window_view(repo, config: dict, now, hours: int, only_type: str | None = None) -> dict:
