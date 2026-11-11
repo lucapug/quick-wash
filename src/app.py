@@ -34,6 +34,14 @@ The booking surface of one booking (issue #10, slice a): `GET /api/bookings/<id>
 the customer's own booking, or the owner panel. The decision is `src/entitlements.py`: 403 for a wrong
 entitlement, 401 for a missing session, and a refusal body identical for a booking that is not yours
 and for one that is not there, so the seam is never an existence oracle.
+
+The report surface of one machine (issue #10, slice b): `POST /api/machines/<code>/report` is a pattern
+for the same reason — the contract fixes one entry per entry point and `POST /api/lock/reports` is that
+entry. It carries R7, the entitlement to report, plus its residue: a report that is taken drives the
+machine's `maintenance` state through the R6 table. The gate is the same decision as the booking surface
+(401 for a missing session, 403 for a wrong entitlement) and the core is the same one, so the two paths
+cannot drift. What an accepted report answers is 202: the report is a claim the seam takes, not a fact a
+device reports, and its consequence is applied to the machine. Reassignment (R8) is its own issue.
 """
 
 from datetime import datetime, timedelta
@@ -81,6 +89,12 @@ PATTERNS = {"POST /api/session/verify": "verify", "GET /api/logs/recent": "logs"
 # `GET /api/bookings/<id>` is one booking that belongs to that customer.
 BOOKING_SURFACE = ("GET", "/api/bookings/")
 BOOKING_CANCEL = ("POST", "/api/bookings/")
+
+# The report surface of one machine (issue #10, slice b): the report read through the machine it is about.
+# A pattern, not a ninth contract path. Only the two reports that name a customer are entitlement-gated:
+# the machine a device reports on is not the caller's, the machine a person reports on is — R7.
+REPORT_SURFACE = ("POST", "/api/machines/")
+REPORT_KINDS = ("fault", "occupied")
 
 # The reviewer's observer (issue #6, AC8): a caller with no session can still watch the shop live — the
 # public availability view, the state of one machine, the incident list. It is not an identity, and that
@@ -140,10 +154,16 @@ class Application:
         return status, payload
 
     def pattern_route(self, method: str, path: str) -> str | None:
-        """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs."""
+        """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs.
+
+        The report surface of one machine is a pattern too: `POST /api/lock/reports` is the contract entry
+        for a report, and the machine it is about is the same decision addressed to the machine.
+        """
         name = PATTERNS.get(f"{method} {path}")
         if name:
             return name
+        if method == REPORT_SURFACE[0] and path.startswith(REPORT_SURFACE[1]) and path.endswith("/report"):
+            return "machine_report"
         if method == PER_MACHINE_READ[0] and path.startswith(PER_MACHINE_READ[1]):
             return "machine"
         if path.startswith(BOOKING_SURFACE[1]):
@@ -696,16 +716,70 @@ class Application:
                      "message": "Turno perso: macchina liberata"}
 
     def handle_fault(self, body, headers, now, path=None):
+        """The same entitlement as the booking surface, read through the report path.
+
+        A device report answers 200 because the device is not claiming an entitlement, it is naming a fact
+        it observed; a person's report on `POST /api/machines/<code>/report` is the claim and is answered
+        202. Both paths gate on the same predicate in `src/entitlements.py` and run the same core, so they
+        cannot answer differently for the same caller. A refusal writes nothing: the machine keeps the
+        state the table had for it and no incident is recorded.
+        """
         who = self.customer(headers)
         if who is None:
-            return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
         machine = self.repo.machine(body.get("machine", ""))
         if machine is None:
-            return 404, {"error": "unknown_machine", "message": "Macchina sconosciuta"}
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
         # R7: only a customer who has or had a booking on that machine may report it.
-        if not self.repo.bookings_on_machine(machine["id"], who["email"]):
-            return 403, {"error": "not_allowed", "message": "Puoi segnalare solo una macchina su cui hai o hai avuto una prenotazione"}
+        if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
+            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
+        return self.apply_fault(who, machine, now)
 
+    def handle_machine_report(self, body, headers, path=None):
+        """AC1, AC2, AC3: the report entitlement and its residue, enforced at the seam.
+
+        The report is addressed to the machine named in the URL, so the entitlement is read against that
+        machine: 401 for a caller with no session, 403 for a caller who never had a turn on it. The gate
+        is decided before anything else is checked, so a caller who already holds the machine code — the
+        code is public, it is what the assignment shows — is refused exactly as a caller who holds a
+        booking id is. A refused report writes nothing; an accepted one drives the machine's state, which
+        is the whole residue this slice carries (R8 is issue #17).
+        """
+        who = self.customer(headers)
+        if who is None:
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        machine = self.repo.machine(self.machine_code_of(path))
+        if machine is None:
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
+        if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
+            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
+        kind = body.get("kind") or body.get("event")
+        if kind not in REPORT_KINDS:
+            return 400, {"error": "unknown_kind", "message": "Segnalazione sconosciuta",
+                          "accepted": list(REPORT_KINDS)}
+        self.trace(self.repo.open_booking(machine["id"]))
+        return self.apply_report(who, machine, kind, self.clock.now())
+
+    def machine_code_of(self, path) -> str:
+        """The machine the request names, read off the URL segment, report suffix stripped."""
+        tail = (path or "").split("/api/machines/", 1)[1]
+        return tail.removesuffix("/report")
+
+    def apply_report(self, who, machine, kind, now) -> tuple[int, dict]:
+        """A report that is taken: the kind decides which core runs, and both write through the R6 table.
+
+        The two seam paths differ on the success status only. A device report is a fact the controller
+        observed and is answered 200; a person's report is a claim the seam accepts and acts on, so the
+        report surface acknowledges it with 202. A refusal keeps whatever status the decision gave it.
+        """
+        status, payload = (self.apply_fault(who, machine, now) if kind == "fault"
+                           else self.apply_occupied(who, machine, now))
+        return (entitlements.REPORT_ACCEPTED if status == entitlements.ALLOWED else status), payload
+
+    def apply_fault(self, who, machine, now) -> tuple[int, dict]:
+        # R7's residue: the report drives `maintenance` through the declared hop. Reassignment (R8) is
+        # another issue; what this slice owns is that no report from a caller who is not entitled reaches
+        # this line at all.
         self.transition(machine["id"], "maintenance", now)
         reassigned, cancelled = [], []
         for booking in self.repo.bookings_on_machine(machine["id"]):
@@ -728,29 +802,31 @@ class Application:
                                "start": hhmm(start), "tokens": tariff.tokens_required})
             self.repo.record_incident("reassignment", now, f"moved off {machine['code']}",
                                       booking["email"], replacement["id"], booking["id"])
-        return 200, {"outcome": "maintenance", "machine": machine["code"], "reassigned": reassigned,
+        return entitlements.ALLOWED, {"outcome": "maintenance", "machine": machine["code"], "reassigned": reassigned,
                      "cancelled": cancelled, "message": "Macchina messa fuori servizio"}
 
     def handle_occupied(self, body, headers, now, path=None):
         who = self.customer(headers)
         if who is None:
-            return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
         machine = self.repo.machine(body.get("machine", ""))
         if machine is None:
-            return 404, {"error": "unknown_machine", "message": "Macchina sconosciuta"}
-        if not self.repo.bookings_on_machine(machine["id"], who["email"]):
-            return 403, {"error": "not_allowed", "message": "Puoi segnalare solo una macchina su cui hai o hai avuto una prenotazione"}
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
+        if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
+            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
+        return self.apply_occupied(who, machine, now)
 
+    def apply_occupied(self, who, machine, now) -> tuple[int, dict]:
         self.transition(machine["id"], "cleaning_required", now)
         booking = next((row for row in self.repo.bookings_for(who["email"])
                         if row["machine_id"] == machine["id"] and row["state"] in ("confirmed", "unlocked", "running")), None)
         if booking is None:
-            return 403, {"error": "no_active_booking", "message": "Nessuna prenotazione attiva su questa macchina"}
+            return entitlements.NOT_ENTITLED, {"error": "no_active_booking", "message": "Nessuna prenotazione attiva su questa macchina"}
 
         start = parse(booking["start_time"])
         replacement = self.pick_machine(machine["type"], start)
         if replacement is None:
-            return 200, {"outcome": "cleaning_required", "machine": machine["code"], "reassigned": None,
+            return entitlements.ALLOWED, {"outcome": "cleaning_required", "machine": machine["code"], "reassigned": None,
                          "message": "Macchina segnata per la pulizia: nessuna macchina libera dello stesso tipo"}
         new_code = self.repo.next_code(now)
         self.db.execute("UPDATE bookings SET machine_id = ?, code = ? WHERE id = ?",
@@ -759,7 +835,7 @@ class Application:
         self.repo.record_incident("cleaning_required", now, f"reported still occupied on {machine['code']}",
                                   who["email"], machine["id"], booking["id"])
         cleaned_at = now + timedelta(minutes=self.config["cleaning_buffer_minutes"])
-        return 200, {"outcome": "cleaning_required", "machine": machine["code"],
+        return entitlements.ALLOWED, {"outcome": "cleaning_required", "machine": machine["code"],
                      "cleaning_minutes": self.config["cleaning_buffer_minutes"], "clean_until": hhmm(cleaned_at),
                      "reassigned": {"booking": booking["id"], "machine": replacement["code"], "code": new_code,
                                     "start": hhmm(start)},
