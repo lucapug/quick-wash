@@ -2,7 +2,9 @@
 
 Configuration is data, not a screen (docs/spec.md, Application shape). The numbers here are the
 signed addendum's where it disagrees with docs/spec.md: turnover buffer 10 minutes, cleaning
-buffer 30 minutes (patch 2), OTP shown in-app with no email or SMS transport (patch 1).
+buffer 30 minutes (patch 2), OTP shown in-app with no email or SMS transport (patch 1), one-time code
+single-use and valid 10 minutes (issue #9, AC4). The code's TTL is read back over HTTP as the expiry the
+sign-in response carries.
 
 Inventory is the pack's seed: 8 machines, 4 standard, 2 family, 2 quick (tests/conftest.py).
 The split is 4 + 2 + 2: the pack fixes the total at 8 but not the split, and R7/R8 reassignment to a
@@ -33,4 +35,7 @@ SEED = {
     "bookings_per_day": 2,
     "owner_email": "owner@quickwash.local",
     "otp_displayed_in_app": True,
+    # AC4: the one-time code is single-use and lives 10 minutes. Held as a number here, like every
+    # other number in this project, so the seam can read it back (issue #5, AC 7).
+    "otp_ttl_minutes": 10,
 }
