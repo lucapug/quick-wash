@@ -24,6 +24,12 @@ the id (a copied link, a shared screen) or the machine code is still refused. Th
 entitlement plus its residue — an accepted report drives `maintenance`; the reassignment it triggers
 (R8) is its own issue.
 
+The owner-panel entitlement (issue #10, slice c) is the third holder: the panel is open to the
+identity the sign-in marks with the owner flag (US58), and to no other caller — not the customer who
+holds a booking id, not the reviewer with no session, because the panel is not a read, it is the owner's
+own surface. The same decision as the booking surface, so the same two statuses: 403 for a wrong
+entitlement, 401 for a missing session.
+
 No I/O here: `who` is the identity the session resolves to, `booking` is the row or None,
 `had_booking` is the fact that the caller had a turn on that machine (the rows, or their truthiness).
 """
@@ -45,6 +51,18 @@ def may_touch(who: dict | None, booking: dict | None) -> bool:
     if who is None or booking is None:
         return False
     return booking["email"] == who["email"] or bool(who.get("is_owner"))
+
+
+def may_enter_panel(who: dict | None) -> bool:
+    """US58, in one line: the owner panel is open to the identity the sign-in marks as the owner.
+
+    Nothing else is read — not a booking, not a machine, not a flag the caller could send in a body.
+    A caller with no session has no identity to be entitled with, so it cannot hold this entitlement
+    either: it is answered 401, and that is the reason the two statuses must stay two.
+    """
+    if who is None:
+        return False
+    return bool(who.get("is_owner"))
 
 
 def may_report(who: dict | None, had_booking) -> bool:
@@ -83,6 +101,17 @@ def report_refusal() -> dict:
     """403 on the report surface: not your machine, and no report is taken from somebody who never had a turn on it."""
     return {"error": "not_your_machine",
             "message": "Non è tua: puoi segnalare solo una macchina su cui hai o hai avuto una prenotazione"}
+
+
+def panel_refusal() -> dict:
+    """403 on the owner panel: the panel is the owner's, and a customer cannot reach it.
+
+    The copy is the entitlement copy — "non è tuo" — and not the sign-in copy, so a test can tell the
+    two outcomes apart from outside the seam. Nothing in the body names the machine or the booking the
+    request was addressed to: the refusal is the decision, not a fact about what exists.
+    """
+    return {"error": "not_the_owner",
+            "message": "Non è tuo: il pannello proprietario è riservato al proprietario"}
 
 
 def unknown_machine() -> dict:

@@ -42,6 +42,15 @@ machine's `maintenance` state through the R6 table. The gate is the same decisio
 (401 for a missing session, 403 for a wrong entitlement) and the core is the same one, so the two paths
 cannot drift. What an accepted report answers is 202: the report is a claim the seam takes, not a fact a
 device reports, and its consequence is applied to the machine. Reassignment (R8) is its own issue.
+
+The owner panel (issue #10, slice c): the five surfaces the panel owns — the status board, the machine
+list, the incident list, the maintenance toggle and the manual cancellation of a booking — are the
+`/api/owner/` surface, patterns rather than contract paths, so `ROUTES` stays exactly the eight entries
+tests/test_seam.py pins. Access to them is the owner flag (US58), decided by `owner_gate` before the
+handler runs: 401 for a caller with no session, 403 for a session that is not the owner. The gate is
+enforcement at the seam, not a control the front-end hides — a customer who already holds the machine
+code or the booking id is refused on the panel path exactly as on the customer path, and a refusal
+writes nothing.
 """
 
 from datetime import datetime, timedelta
@@ -95,6 +104,19 @@ BOOKING_CANCEL = ("POST", "/api/bookings/")
 # the machine a device reports on is not the caller's, the machine a person reports on is — R7.
 REPORT_SURFACE = ("POST", "/api/machines/")
 REPORT_KINDS = ("fault", "occupied")
+
+# The owner panel (issue #10, slice c): the surfaces the panel owns, and the two things it can write.
+# Patterns, not contract paths, so `ROUTES` stays exactly the eight entries tests/test_seam.py pins.
+# Three reads — the status board (US53), the machine list, the incident list (US57) — and two writes:
+# the maintenance toggle (US54) and the manual cancellation of a booking (US56). The two writes are
+# addressed to what the URL names, the same way the booking and the report surfaces are.
+OWNER_PANEL = "/api/owner/"
+OWNER_READS = ("status-board", "machines", "incidents")
+OWNER_RESOURCES = ("machines", "bookings")
+OWNER_WRITES = ("maintenance", "cancel")
+# US54 asks for both directions of the toggle. `maintenance` is reached through the table, `available`
+# is the declared hop back out, so the toggle never writes a hop the table does not declare.
+TOGGLE_STATES = ("maintenance", "available")
 
 # The reviewer's observer (issue #6, AC8): a caller with no session can still watch the shop live — the
 # public availability view, the state of one machine, the incident list. It is not an identity, and that
@@ -157,11 +179,16 @@ class Application:
         """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs.
 
         The report surface of one machine is a pattern too: `POST /api/lock/reports` is the contract entry
-        for a report, and the machine it is about is the same decision addressed to the machine.
+        for a report, and the machine it is about is the same decision addressed to the machine. So is the
+        owner panel (issue #10, slice c): the contract fixes the owner's two reads, and the panel's own
+        surfaces are the pattern over them.
         """
         name = PATTERNS.get(f"{method} {path}")
         if name:
             return name
+        surface = self.owner_surface(method, path)
+        if surface is not None:
+            return f"owner_{surface[0].replace('-', '_')}"
         if method == REPORT_SURFACE[0] and path.startswith(REPORT_SURFACE[1]) and path.endswith("/report"):
             return "machine_report"
         if method == PER_MACHINE_READ[0] and path.startswith(PER_MACHINE_READ[1]):
@@ -174,6 +201,23 @@ class Application:
                 return "booking_read"
             if method == BOOKING_CANCEL[0] and tail.endswith("/cancel"):
                 return "cancel"
+        return None
+
+    def owner_surface(self, method: str, path: str) -> tuple[str, str | None] | None:
+        """Which panel surface the request addresses, and what it names.
+
+        The read surfaces name nothing; the two write surfaces are addressed to a machine or to a
+        booking — `POST /api/owner/machines/m1/maintenance`, `POST /api/owner/bookings/b1/cancel` — and
+        they are refused before anything the panel would do runs, so a request a UI would render as
+        clickable is still refused (AC3).
+        """
+        if not (path or "").startswith(OWNER_PANEL):
+            return None
+        tail = path[len(OWNER_PANEL):].strip("/").split("/")
+        if method == "GET" and len(tail) == 1 and tail[0] in OWNER_READS:
+            return tail[0], None
+        if method == "POST" and len(tail) == 3 and tail[0] in OWNER_RESOURCES and tail[2] in OWNER_WRITES:
+            return tail[2], tail[1]
         return None
 
     def resolve_buffers(self, now) -> None:
@@ -549,6 +593,15 @@ class Application:
         status, denial = self.booking_entitlement(who, booking)
         if status != entitlements.ALLOWED:
             return status, denial
+        return self.cancel_booking(booking)
+
+    def cancel_booking(self, booking) -> tuple[int, dict]:
+        """The cancellation core, once: the same write behind the customer's cancel and the panel's.
+
+        The entitlement is decided by the caller's gate before this runs, so the only thing left here is
+        the state test (R4 is issue #15) and the write itself. Splitting it out is what keeps the two
+        paths from answering differently for the same booking.
+        """
         now = self.clock.now()
         if booking["state"] != "confirmed":
             # US46: the state of a booking that can no longer be cancelled is shown. The window that
@@ -859,29 +912,176 @@ class Application:
         machine = self.repo.create_machine(type_key, self.clock.now())
         return 201, domain.machine_view(machine, self.config)
 
-    # --- owner panel ---------------------------------------------------------
+    # --- owner panel (issue #10, slice c) -----------------------------------
+
+    def owner_gate(self, headers) -> tuple[int, dict | None]:
+        """AC1 and AC3: the panel gate, in one place, before any panel surface runs.
+
+        401 for a caller with no session, 403 for a session that is not the owner — the two outcomes
+        stay externally distinguishable, and the copy is different: "accedi" for the missing session,
+        "non è tuo" for the wrong entitlement. The decision is `src/entitlements.py`. The reviewer with
+        no session is answered 401 as well: it is not an identity, so there is nothing to be entitled
+        with, and the panel is not one of the reads issue #6, AC 8 leaves it. The gate runs before
+        anything the panel would do, so a customer holding a real machine code or a real booking id is
+        refused on the panel path too: enforcement is the 403 on the request she can still make, not a
+        control the front-end hides.
+        """
+        who = self.who_is_asking(headers)
+        if who is None or who.get("is_observer"):
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        if entitlements.may_enter_panel(who):
+            return entitlements.ALLOWED, None
+        return entitlements.NOT_ENTITLED, entitlements.panel_refusal()
+
+    def panel_named(self, path) -> str | None:
+        """What a panel write names: the machine or the booking carried by the URL segment."""
+        return self.owner_surface("POST", path)[1]
+
+    def panel_machine(self, named) -> dict | None:
+        """The machine the panel request names: the code as written, or the id the segment reads as."""
+        if not named:
+            return None
+        found = self.repo.machine(named) or self.repo.machine(named.upper())
+        return found or self.repo.machine_by_id(int(named) if named.isdigit() else None)
+
+    def panel_booking_id(self, named) -> int | None:
+        """The booking the panel request names, the same way `booking_id_of` reads a booking segment."""
+        if not named:
+            return None
+        segment = named[1:] if named[:1].lower() == "b" else named
+        return int(segment) if segment.isdigit() else None
+
+    def toggle_target(self, body, machine) -> str:
+        """US54 in both directions: the state the toggle is asked for, or the flip of the one it is in."""
+        asked = body.get("state")
+        if asked in TOGGLE_STATES:
+            return asked
+        return "available" if machine["state"] == "maintenance" else "maintenance"
+
+    def handle_owner_machines(self, body, headers, path=None):
+        """AC1: the panel's machine list, gated on the owner flag."""
+        status, denial = self.owner_gate(headers)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        return 200, {"machines": self.owner_board()}
+
+    def handle_owner_status_board(self, body, headers, path=None):
+        """AC2: the status board (US53) — every machine, its state live, and what is attached to it.
+
+        The same rows the contract board answers with, read as the panel reads them: the state, the
+        buffer the machine is inside, and the bookings the owner sees before taking it out of service
+        (US55). Nothing here is a different rule: `is_assignable` and `buffer_of` are the same predicates
+        the public view answers on.
+        """
+        status, denial = self.owner_gate(headers)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        now = self.clock.now()
+        rows = []
+        for machine in self.repo.machines():
+            buffer, bookable_from = self.buffer_of(machine, now)
+            rows.append({**self.panel_row(machine), "changed_at": machine["changed_at"],
+                         "buffer_minutes": buffer, "bookable_from": bookable_from,
+                         "assignable": self.is_assignable(machine, now)})
+        counts = {row["state"]: sum(1 for other in rows if other["state"] == row["state"]) for row in rows}
+        return 200, {"status_board": rows, "counts": dict(sorted(counts.items())), "as_of": hhmm(now)}
+
+    def handle_owner_incidents(self, body, headers, path=None):
+        """AC2: the incident list as the owner's surface, not as the reviewer's read.
+
+        `GET /api/incidents` is the contract entry the observer keeps (issue #6, AC8); the panel path is
+        the owner's, so it is closed to a customer and it answers with the list that carries the
+        customer — US57 is what the owner reads to see what the shop suffered.
+        """
+        status, denial = self.owner_gate(headers)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        return 200, self.incident_list(self.who_is_asking(headers))
+
+    def handle_owner_maintenance(self, body, headers, path=None):
+        """AC2 and AC3: the maintenance toggle, refused before the write, executed for the owner.
+
+        A refused toggle writes nothing: the machine keeps the state the table had for it and no incident
+        is recorded. For the owner both directions are hops the table declares — out of service through
+        the R7 core (which is what R8 reassignment runs on), and back in service through the declared hop
+        out of `maintenance`.
+        """
+        status, denial = self.owner_gate(headers)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        machine = self.panel_machine(self.panel_named(path))
+        if machine is None:
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
+        now = self.clock.now()
+        who = self.who_is_asking(headers)
+        target = self.toggle_target(body, machine)
+        if target == "maintenance":
+            self.repo.record_incident("maintenance", now, f"taken out of service on {machine['code']}",
+                                      who["email"], machine["id"], None)
+            return self.apply_fault(who, machine, now)
+        self.transition(machine["id"], "available", now, event="maintenance_lifted")
+        self.repo.record_incident("maintenance_lifted", now, f"back in service on {machine['code']}",
+                                  who["email"], machine["id"], None)
+        return 200, {"outcome": "available", "machine": machine["code"],
+                      "message": "Macchina di nuovo disponibile"}
+
+    def handle_owner_cancel(self, body, headers, path=None):
+        """AC2 and AC3: the manual cancellation (US56), gated on the owner flag first.
+
+        The gate runs before the lookup, so a customer who already holds a real booking id is refused on
+        the panel path exactly as on the customer path. Only after the gate does the panel get the 404 —
+        the owner is entitled to know that a booking exists (US56), which is why the refusal body a
+        customer gets cannot say whether the booking is there.
+        """
+        status, denial = self.owner_gate(headers)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        booking = self.repo.booking_by_id(self.panel_booking_id(self.panel_named(path)))
+        if booking is None:
+            return 404, entitlements.not_found()
+        return self.cancel_booking(booking)
 
     def handle_machines(self, body, headers, path=None):
+        """The contract path for the owner board, answered as the identity layer pinned it.
+
+        `GET /api/machines` is one of the eight contract entries, and its answer for a caller that is not
+        the owner is the 403 tests/integration/test_identity_layer.py and tests/test_journey.py assert —
+        the panel stays closed to a customer, and to the observer that has no session. The core is the
+        panel's core: the same `owner_board`, so the two paths cannot drift.
+        """
         who = self.who_is_asking(headers)
         if who is None or not who["is_owner"]:
             return 403, {"error": "owner_only", "message": "Il pannello proprietario è riservato al proprietario"}
-        board = []
-        for machine in self.repo.machines():
-            attached = [row for row in self.repo.bookings_on_machine(machine["id"])
-                        if row["state"] in ("confirmed", "unlocked", "running")]
-            board.append({**domain.machine_view(machine, self.config),
-                          "machine": machine["code"],
-                          "bookings": [self.booking_view(row, machine["code"]) for row in attached]})
-        return 200, {"machines": board}
+        return 200, {"machines": self.owner_board()}
 
     def handle_incidents(self, body, headers, path=None):
+        """The contract path for the incident list: the owner's read and the reviewer's read.
+
+        A signed-in customer still cannot read it. The observer has no session to begin with, and AC 8 of
+        issue #6 asks for that reviewer to watch the shop live, so the observer's list is the one with no
+        customer in it.
+        """
         who = self.who_is_asking(headers)
         if not self.may_observe(who):
             return 403, {"error": "owner_only", "message": "Il pannello proprietario è riservato al proprietario"}
-        # The response is the list itself: the incident list is what a reviewer reads to see what the
-        # shop suffered. A signed-in customer still cannot read it, and an observer sees no customer.
-        return 200, [self.incident_view(row, observer=bool((who or {}).get("is_observer")))
-                     for row in self.repo.incidents()]
+        return 200, self.incident_list(who)
+
+    def owner_board(self) -> list[dict]:
+        """The board as the panel reads it: every machine, and the bookings attached to it (US55)."""
+        return [self.panel_row(machine) for machine in self.repo.machines()]
+
+    def panel_row(self, machine) -> dict:
+        """One board row, in one place, so the contract path and the panel path answer the same shape."""
+        attached = [row for row in self.repo.bookings_on_machine(machine["id"])
+                    if row["state"] in ("confirmed", "unlocked", "running")]
+        return {**domain.machine_view(machine, self.config),
+                "machine": machine["code"],
+                "bookings": [self.booking_view(row, machine["code"]) for row in attached]}
+
+    def incident_list(self, who) -> list[dict]:
+        """US57: what the shop suffered, in one place. A customer's name is in it only for the owner."""
+        return [self.incident_view(row, observer=bool((who or {}).get("is_observer")))
+                for row in self.repo.incidents()]
 
     def incident_view(self, row, observer: bool = False) -> dict:
         """An incident carries the machine it happened on as the reviewer reads it: the machine code."""
@@ -907,13 +1107,21 @@ class Application:
         if machine is None:
             return 404, {"error": "unknown_machine", "message": "Macchina sconosciuta"}
         view = domain.machine_view(machine, self.config)
-        key = machine_states.BUFFER_HOPS.get(machine["state"])
-        buffer = self.config[key] if key else None
-        bookable_from = self.clock.now() + timedelta(minutes=buffer) if buffer else None
+        buffer, bookable_from = self.buffer_of(machine, self.clock.now())
         return 200, {**view, "machine": machine["code"], "state": machine["state"],
                      "changed_at": machine["changed_at"], "buffer_minutes": buffer,
-                     "bookable_from": hhmm(bookable_from) if bookable_from else None,
+                     "bookable_from": bookable_from,
                      "assignable": self.is_assignable(machine, self.clock.now())}
+
+    def buffer_of(self, machine, now) -> tuple[int | None, str | None]:
+        """The buffer a machine is inside, as the same predicate the board answers on (R10, patch 2).
+
+        One reading, so the per-machine read and the panel's status board cannot disagree about whether a
+        machine is inside its turnover buffer or its cleaning buffer.
+        """
+        key = machine_states.BUFFER_HOPS.get(machine["state"])
+        buffer = self.config[key] if key else None
+        return buffer, hhmm(now + timedelta(minutes=buffer)) if buffer else None
 
     # --- state machine (R6) -------------------------------------------------
 
