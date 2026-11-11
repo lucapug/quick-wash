@@ -28,11 +28,17 @@ the gate this module enforces: no booking is created for a caller without a sess
 caller is no longer a customer that can book — it is the reviewer's observer, and it keeps its reads.
 The telemetry read is the reviewer's view of the request lines; the recorder itself (`src/telemetry.py`)
 is what keeps a credential out of them (AC3).
+
+The booking surface of one booking (issue #10, slice a): `GET /api/bookings/<id>` and
+`POST /api/bookings/<id>/cancel` are patterns, not extra contract paths, and they are entitlements —
+the customer's own booking, or the owner panel. The decision is `src/entitlements.py`: 403 for a wrong
+entitlement, 401 for a missing session, and a refusal body identical for a booking that is not yours
+and for one that is not there, so the seam is never an existence oracle.
 """
 
 from datetime import datetime, timedelta
 
-from src import availability, domain, machine_states, rules
+from src import availability, domain, entitlements, machine_states, rules
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import time as start_times
@@ -68,6 +74,13 @@ PER_MACHINE_READ = ("GET", "/api/machines/")
 # code, and the telemetry read. The contract fixes the sign-in request; the code it showed in-app is
 # redeemed on its sub-path, and the log lines are read on theirs.
 PATTERNS = {"POST /api/session/verify": "verify", "GET /api/logs/recent": "logs"}
+
+# The booking surface of one booking (issue #10, slice a): the read of a booking and its cancellation.
+# Patterns, not contract paths, so `ROUTES` stays exactly the eight entries tests/test_seam.py pins —
+# the contract fixes one entry per entry point, and `GET /api/bookings` is the customer's list while
+# `GET /api/bookings/<id>` is one booking that belongs to that customer.
+BOOKING_SURFACE = ("GET", "/api/bookings/")
+BOOKING_CANCEL = ("POST", "/api/bookings/")
 
 # The reviewer's observer (issue #6, AC8): a caller with no session can still watch the shop live — the
 # public availability view, the state of one machine, the incident list. It is not an identity, and that
@@ -133,6 +146,14 @@ class Application:
             return name
         if method == PER_MACHINE_READ[0] and path.startswith(PER_MACHINE_READ[1]):
             return "machine"
+        if path.startswith(BOOKING_SURFACE[1]):
+            tail = path[len(BOOKING_SURFACE[1]):].strip("/")
+            if not tail:
+                return None
+            if method == BOOKING_SURFACE[0]:
+                return "booking_read"
+            if method == BOOKING_CANCEL[0] and tail.endswith("/cancel"):
+                return "cancel"
         return None
 
     def resolve_buffers(self, now) -> None:
@@ -251,6 +272,34 @@ class Application:
         """A signed-in customer never reads the owner panel. The observer has no session to begin with,
         and AC 8 asks for that reviewer to watch the state machine live."""
         return who is None or bool(who.get("is_observer")) or bool(who.get("is_owner"))
+
+    # --- entitlements on the booking surface (issue #10, slice a) ------------
+
+    def booking_entitlement(self, who, booking) -> tuple[int, dict | None]:
+        """The gate, in one place: 401 for a missing session, 403 for a wrong entitlement.
+
+        AC1 lives here. For a caller who is not entitled the answer is the same body whether the
+        booking exists or not, so the seam cannot be used to find out which ids are real by asking
+        for one that is not. Only the owner panel — entitled to know a booking exists, because the
+        owner cancels or reassigns a booking (US56) — gets the 404.
+        """
+        if who is None:
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        if entitlements.may_touch(who, booking):
+            return entitlements.ALLOWED, None
+        if booking is None and who.get("is_owner"):
+            return 404, entitlements.not_found()
+        return entitlements.NOT_ENTITLED, entitlements.refusal()
+
+    def booking_id_of(self, path) -> int | None:
+        """The booking the request names, read off the URL segment. A segment that is not an id is
+        answered by the same refusal as a booking that is not there: nothing here says whether it is."""
+        tail = (path or "").split(BOOKING_SURFACE[1], 1)
+        if len(tail) < 2:
+            return None
+        segment = tail[1].split("/")[0]
+        return int(segment) if segment.isdigit() else None
+
     # --- availability (public, US8) ----------------------------------------
 
     def handle_availability(self, body, headers, path=None):
@@ -452,6 +501,53 @@ class Application:
             "block": {"blocked": rules.no_show_block(self.repo.no_shows(who["email"]), today, self.config)},
         }
 
+    def handle_booking_read(self, body, headers, path=None):
+        """AC2: one booking is read by the customer it belongs to, and by nobody else.
+
+        A booking is the customer's: the unlock code is displayed only inside that booking (spec,
+        Identity), so the read that answers with a booking cannot be answered to another caller. The
+        decision is `src/entitlements.py`; the body of the refusal is the one that cannot say whether
+        the booking exists.
+        """
+        booking = self.repo.booking_by_id(self.booking_id_of(path))
+        status, denial = self.booking_entitlement(self.customer(headers), booking)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        self.trace(booking)
+        return 200, {"booking": self.booking_view(booking)}
+
+    def handle_cancel(self, body, headers, path=None):
+        """AC2 and AC3: the entitlement is decided before anything else is checked.
+
+        The refusal is at the seam, not in what the front-end shows: a caller who already holds the
+        id is refused even on a booking a UI would render as clickable. Nothing is written for a
+        caller who is not entitled. The cancellation window (R4) is issue #15 — this slice carries the
+        entitlement, and here only the state that is already committed to a machine is refused.
+        """
+        booking = self.repo.booking_by_id(self.booking_id_of(path))
+        who = self.customer(headers)
+        status, denial = self.booking_entitlement(who, booking)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        now = self.clock.now()
+        if booking["state"] != "confirmed":
+            # US46: the state of a booking that can no longer be cancelled is shown. The window that
+            # decides it (R4) is issue #15; here the machine is already committed, so the state is the
+            # whole of the answer.
+            return 409, {"error": "not_cancellable", "state": booking["state"],
+                          "message": f"La prenotazione non è cancellabile: stato {booking['state']}"}
+        self.trace(booking)
+        machine = self.repo.machine_by_id(booking["machine_id"])
+        self.repo.set_booking_state(booking["id"], "cancelled")
+        if machine is not None and machine["state"] == "reserved":
+            # US45: the slot becomes bookable by others at once.
+            self.transition(machine["id"], "available", now)
+        self.repo.record_incident("cancellation", now, "cancelled at the seam", booking["email"],
+                                  booking["machine_id"], booking["id"])
+        # The answer is the booking as the row is now, not as it was when the request arrived.
+        return 200, {"outcome": "cancelled", "booking": self.booking_view(self.repo.booking_by_id(booking["id"])),
+                      "message": "Prenotazione cancellata: lo slot torna disponibile"}
+
     def booking_view(self, booking, machine_code=None):
         start = parse(booking["start_time"])
         grace_from, grace_to = rules.grace_window(start, self.config)
@@ -460,7 +556,9 @@ class Application:
             row = self.db.one("SELECT code FROM machines WHERE id = ?", (booking["machine_id"],))
             machine = row["code"] if row else None
         return {
-            "id": booking["id"],
+            # The id on the wire is the string the URL segment reads as: `GET /api/bookings/<id>` is
+            # the same booking, seen from the seam. The row keeps the integer, the response the name.
+            "id": str(booking["id"]),
             "machine": machine,
             "type": booking.get("type") or (self.db.one(
                 "SELECT type FROM machines WHERE id = ?", (booking["machine_id"],)) or {}).get("type"),

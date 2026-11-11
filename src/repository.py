@@ -151,6 +151,14 @@ class Repository:
     def booking_by_code(self, code: str) -> dict | None:
         return self.db.one("SELECT * FROM bookings WHERE code = ?", (code,))
 
+    def booking_by_id(self, booking_id: int | None) -> dict | None:
+        """The booking one request names. None is the case the seam must not be able to tell apart
+        from the case that is not entitled, so the lookup answers with the row and nothing else —
+        the refusal is decided by `src/entitlements.py`, not here."""
+        if booking_id is None:
+            return None
+        return self.db.one("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+
     def bookings_for(self, email: str) -> list[dict]:
         return self.db.rows("SELECT * FROM bookings WHERE email = ? ORDER BY start_time", (email,))
 

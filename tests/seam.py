@@ -3,6 +3,10 @@
 `client.session(email)` performs the sign-in once and returns a session object with `.headers` and
 `.token`, so a test can tell who is asking on every later request. Responses record their body so
 the pytest hook in tests/fixtures.py can print it when an assertion fails.
+
+The two things the issue bodies write are what the client answers to: a session passed straight as
+`headers=` (the mapping itself), and the body read as `.text()` as well as `.text`. Nothing in a test
+is adjusted to fit the client.
 """
 
 import json
@@ -15,10 +19,22 @@ except ImportError:  # pragma: no cover
     httpx = None
 
 
+class Text(str):
+    """A response body that reads both ways.
+
+    The tests written against an HTTP client read the body as `.text`; the tests in the issue bodies
+    write `.text()`. A string that answers when called returns itself, so one Response satisfies both
+    and a test is never adjusted to fit the client.
+    """
+
+    def __call__(self) -> str:
+        return self
+
+
 class Response:
     def __init__(self, status: int, body: str, headers: dict, request: str) -> None:
         self.status_code = status
-        self.text = body
+        self.text = Text(body)
         self.headers = {key.lower(): value for key, value in headers.items()}
         self.request = request
 
@@ -27,13 +43,33 @@ class Response:
 
 
 class Session:
-    """A sign-in reused across requests: the seam knows who is asking."""
+    """A sign-in reused across requests: the seam knows who is asking.
+
+    A session is also the header mapping a request takes, because the tests write `headers=a` and not
+    `headers=a.headers`: the session *is* the header that says who is asking, so `dict(session)` and
+    `session.headers` are the same thing.
+    """
 
     def __init__(self, email: str, token: str, otp: str) -> None:
         self.email = email
         self.token = token
         self.otp = otp
         self.headers = {"Authorization": f"Bearer {token}"}
+
+    def keys(self) -> list:
+        return list(self.headers)
+
+    def items(self) -> list:
+        return list(self.headers.items())
+
+    def __getitem__(self, key: str) -> str:
+        return self.headers[key]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self.headers)
 
     def __repr__(self) -> str:
         return f"<session {self.email}>"
