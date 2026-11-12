@@ -39,9 +39,21 @@ The report surface of one machine (issue #10, slice b): `POST /api/machines/<cod
 for the same reason — the contract fixes one entry per entry point and `POST /api/lock/reports` is that
 entry. It carries R7, the entitlement to report, plus its residue: a report that is taken drives the
 machine's `maintenance` state through the R6 table. The gate is the same decision as the booking surface
-(401 for a missing session, 403 for a wrong entitlement) and the core is the same one, so the two paths
-cannot drift. What an accepted report answers is 202: the report is a claim the seam takes, not a fact a
-device reports, and its consequence is applied to the machine. Reassignment (R8) is its own issue.
+(401 for a missing session, 403 for a wrong entitlement), so the two paths cannot drift on the permission;
+what they can differ on is the residue the report is allowed to write, and that is one decision in
+`src/faults.py` read from the surface, not a copy of the rule per path. What an accepted report answers is
+202: the report is a claim the seam takes, not a fact a device reports, and its consequence is applied to the
+machine. Reassignment (R8) is its own issue, and the claim surface is the one place its residue is narrower:
+the claim is admitted by a booking record, so it cannot rewrite the record that admits it, and the machine
+keeps exactly its entitled pre-report booking (issue #11, slice b2, AC3). The decision is `src/faults.py`, in one predicate, run by `apply_fault`.
+
+Issue #11, slice b2 is the maintenance invariant alone: a machine in `maintenance` can never be assigned a
+booking, so when it is the only candidate for a slot the seam answers 409 and nothing is created on it. The
+fence is the assignment step reading `src/availability.py` — the same predicate the public view answers on,
+not a pre-check and not a control the front-end hides — and the machine is read through the machine-scoped
+bookings query, `GET /api/bookings?machine=<code>`, which answers the record as a read open to a caller with
+no session can answer it: the machine is public information (US42), so the shape carries no customer and no
+code (US22), exactly as the incident list answered to the observer.
 
 The owner panel (issue #10, slice c): the five surfaces the panel owns — the status board, the machine
 list, the incident list, the maintenance toggle and the manual cancellation of a booking — are the
@@ -55,7 +67,7 @@ writes nothing.
 
 from datetime import datetime, timedelta
 
-from src import availability, domain, entitlements, machine_states, rules
+from src import availability, domain, entitlements, faults, machine_states, rules
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import time as start_times
@@ -145,7 +157,7 @@ class Application:
     # --- seam ---------------------------------------------------------------
 
     def handle(self, method: str, path: str, body: dict | None = None,
-               headers: dict | None = None) -> tuple[int, dict]:
+               headers: dict | None = None) -> tuple[int, dict | list]:
         name = (ROUTES.get((method, path)) or SEED_WRITE.get(f"{method} {path}")
                 or self.pattern_route(method, path))
         # The journey this request belongs to, resolved by the handler: the trace identifier is shared by
@@ -572,7 +584,17 @@ class Application:
     def handle_bookings(self, body, headers, path=None):
         """AC5: on the return visit the customer is recognised by the persisted token and reads only
         their own bookings — the list is filtered by the identity the token resolves to.
+
+        The query decides which shape answers, the same rule that shapes the public availability read
+        (issue #8): when the request names a machine the answer is the machine-scoped list — the read the
+        machine is read through (issue #11, slice b2) — otherwise the caller's own list with its limit and
+        its block. A JSON body cannot be a list of records and a mapping at the same time, so one of the two
+        answers. The machine-scoped form answers to any caller because the machine is the subject and a
+        machine is public information (US42); the caller's own list needs a session, because it is filtered
+        by the identity the token resolves to.
         """
+        if body.get("machine"):
+            return self.machine_bookings(body["machine"])
         who = self.customer(headers)
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
@@ -590,6 +612,36 @@ class Application:
             },
             "block": {"blocked": rules.no_show_block(self.repo.no_shows(who["email"]), today, self.config)},
         }
+
+    def machine_bookings(self, code) -> tuple[int, dict | list]:
+        """The machine-scoped read: the bookings attached to the machine the request names.
+
+        The machine is the subject, and a machine is public information — US42 asks that a machine in
+        `maintenance` be visibly unavailable, which is the same reason `GET /api/machines/<code>` answers
+        without a session. So this read answers to any caller, and the shape is the record as a read open to
+        a caller with no session can carry it: no customer and no code (US22), the way the incident list
+        answered to the observer carries neither (issue #6, AC8).
+
+        For a machine in `maintenance` this list is the record the claim left behind (issue #11, slice b2,
+        AC3): the claim keeps the booking the entitlement was read against, the fence keeps any other booking
+        off the machine, so the list is that one record and nothing else.
+        """
+        machine = self.repo.machine(code)
+        if machine is None:
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
+        return 200, [self.public_booking_view(row, machine["code"])
+                      for row in self.repo.bookings_on_machine(machine["id"])]
+
+    def public_booking_view(self, booking, machine_code=None) -> dict:
+        """One booking in the shape a read that is open to a caller with no session can answer.
+
+        The same record as `booking_view`, with the two spellings of the code taken out: a view answered to a
+        caller who is not entitled to the booking cannot carry the code, because the code lives only inside
+        that booking (US22), and it cannot carry the customer either. One record shape, so the two views
+        cannot drift on anything else.
+        """
+        view = self.booking_view(booking, machine_code)
+        return {key: value for key, value in view.items() if key not in ("unlock_code", "code")}
 
     def handle_booking_read(self, body, headers, path=None):
         """AC2: one booking is read by the customer it belongs to, and by nobody else.
@@ -806,9 +858,11 @@ class Application:
 
         A device report answers 200 because the device is not claiming an entitlement, it is naming a fact
         it observed; a person's report on `POST /api/machines/<code>/report` is the claim and is answered
-        202. Both paths gate on the same predicate in `src/entitlements.py` and run the same core, so they
-        cannot answer differently for the same caller. A refusal writes nothing: the machine keeps the
-        state the table had for it and no incident is recorded.
+        202. Both paths gate on the same predicate in `src/entitlements.py`, so the gate cannot answer
+        differently for the same caller; what they can differ on is which record the report is allowed to
+        change, and that is one decision in `src/faults.py` read from the surface, not a per-path copy of the
+        rule. A refusal writes nothing: the machine keeps the state the table had for it and no incident is
+        recorded.
         """
         who = self.customer(headers)
         if who is None:
@@ -819,7 +873,7 @@ class Application:
         # R7: only a customer who has or had a booking on that machine may report it.
         if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
             return entitlements.NOT_ENTITLED, entitlements.report_refusal()
-        return self.apply_fault(who, machine, now)
+        return self.apply_fault(who, machine, now, faults.DEVICE)
 
     def handle_machine_report(self, body, headers, path=None):
         """AC1, AC2, AC3: the report entitlement and its residue, enforced at the seam.
@@ -828,8 +882,13 @@ class Application:
         machine: 401 for a caller with no session, 403 for a caller who never had a turn on it. The gate
         is decided before anything else is checked, so a caller who already holds the machine code — the
         code is public, it is what the assignment shows — is refused exactly as a caller who holds a
-        booking id is. A refused report writes nothing; an accepted one drives the machine's state, which
-        is the whole residue this slice carries (R8 is issue #17).
+        booking id is. A refused report writes nothing; an accepted one drives the machine's state, and the
+        booking the entitlement was read against stays where it is — the claim is admitted by that record and
+        cannot rewrite it (issue #11, slice b2, AC3). The machine can never be assigned a booking from then on
+        on the other side of the claim: `src/availability.py` is the predicate the assignment step answers on
+        and it never frees a machine in `maintenance`, so a slot only that machine could serve is refused at
+        the seam with the alternatives the caller can actually take. The decision on what the claim may change
+        is `src/faults.py`; R8 in full is the device boundary's work.
         """
         who = self.customer(headers)
         if who is None:
@@ -854,23 +913,39 @@ class Application:
     def apply_report(self, who, machine, kind, now) -> tuple[int, dict]:
         """A report that is taken: the kind decides which core runs, and both write through the R6 table.
 
-        The two seam paths differ on the success status only. A device report is a fact the controller
-        observed and is answered 200; a person's report is a claim the seam accepts and acts on, so the
-        report surface acknowledges it with 202. A refusal keeps whatever status the decision gave it.
+        The two seam paths differ on the success status, and on one thing that is a fact about the record and
+        not about the gate: a device report is a fact the controller observed, is answered 200 and runs R8 in
+        full, while a person's report is a claim the seam admits, is acknowledged with 202, and keeps the
+        booking the entitlement was read against. A refusal keeps whatever status the decision gave it, and the
+        gate is the same decision on both paths.
         """
-        status, payload = (self.apply_fault(who, machine, now) if kind == "fault"
+        status, payload = (self.apply_fault(who, machine, now, faults.CLAIM) if kind == "fault"
                            else self.apply_occupied(who, machine, now))
         return (entitlements.REPORT_ACCEPTED if status == entitlements.ALLOWED else status), payload
 
-    def apply_fault(self, who, machine, now) -> tuple[int, dict]:
-        # R7's residue: the report drives `maintenance` through the declared hop. Reassignment (R8) is
-        # another issue; what this slice owns is that no report from a caller who is not entitled reaches
-        # this line at all.
+    def apply_fault(self, who, machine, now, surface: str = faults.DEVICE) -> tuple[int, dict]:
+        """R7's residue: the report drives `maintenance` through the declared hop, and the machine can never
+        be assigned a booking while it is in it.
+
+        The fence itself is not a pre-check: `src/availability.py` is the predicate the assignment step and the
+        public view both answer on, and a machine in `maintenance` is never free on it, so the refusal is the
+        409 on the request and nothing is written on the machine. What the report is allowed to change on the
+        records already attached to it is `src/faults.py`: R8 in full on the device boundary and on the panel,
+        and on the claim surface the record the entitlement was read against stays (issue #11, slice b2, AC3)
+        — the machine keeps exactly that one booking, because every other future booking still runs R8 and
+        nothing new can be attached to a machine in `maintenance`. A refusal never reaches this line at all.
+        """
         self.transition(machine["id"], "maintenance", now)
-        reassigned, cancelled = [], []
-        for booking in self.repo.bookings_on_machine(machine["id"]):
+        held = self.repo.bookings_on_machine(machine["id"])
+        record = faults.entitled_booking(who, held)
+        reassigned, cancelled, kept = [], [], []
+        for booking in held:
             start = parse(booking["start_time"])
             if start <= now or booking["state"] in ("expired", "cancelled", "closed"):
+                continue
+            if not faults.may_move(booking, surface, record):
+                # AC3: the claim keeps the record it is read against, so the machine keeps exactly it.
+                kept.append(str(booking["id"]))
                 continue
             tariff = domain.tariff_of(machine["type"], self.config)
             replacement = self.pick_machine(machine["type"], start)
@@ -888,8 +963,9 @@ class Application:
                                "start": hhmm(start), "tokens": tariff.tokens_required})
             self.repo.record_incident("reassignment", now, f"moved off {machine['code']}",
                                       booking["email"], replacement["id"], booking["id"])
-        return entitlements.ALLOWED, {"outcome": "maintenance", "machine": machine["code"], "reassigned": reassigned,
-                     "cancelled": cancelled, "message": "Macchina messa fuori servizio"}
+        return entitlements.ALLOWED, {"outcome": "maintenance", "machine": machine["code"],
+                                      "reassigned": reassigned, "cancelled": cancelled, "kept": kept,
+                                      "message": "Macchina messa fuori servizio"}
 
     def handle_occupied(self, body, headers, now, path=None):
         who = self.customer(headers)
@@ -1035,9 +1111,10 @@ class Application:
         """AC2 and AC3: the maintenance toggle, refused before the write, executed for the owner.
 
         A refused toggle writes nothing: the machine keeps the state the table had for it and no incident
-        is recorded. For the owner both directions are hops the table declares — out of service through
-        the R7 core (which is what R8 reassignment runs on), and back in service through the declared hop
-        out of `maintenance`.
+        is recorded. For the owner both directions are hops the table declares — out of service through the
+        R7 core read on the panel surface, where R8 runs in full because the owner is the identity entitled to
+        cancel or reassign a booking (US56), and back in service through the declared hop out of
+        `maintenance`.
         """
         status, denial = self.owner_gate(headers)
         if status != entitlements.ALLOWED:
@@ -1051,7 +1128,7 @@ class Application:
         if target == "maintenance":
             self.repo.record_incident("maintenance", now, f"taken out of service on {machine['code']}",
                                       who["email"], machine["id"], None)
-            return self.apply_fault(who, machine, now)
+            return self.apply_fault(who, machine, now, faults.PANEL)
         self.transition(machine["id"], "available", now, event="maintenance_lifted")
         self.repo.record_incident("maintenance_lifted", now, f"back in service on {machine['code']}",
                                   who["email"], machine["id"], None)
