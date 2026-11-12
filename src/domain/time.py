@@ -30,6 +30,12 @@ REFUSAL_REASONS = ("outside_opening_hours", "closed_day", "would_overrun_closing
 # The grid case is a quantisation, not one of the three causes (see the module docstring).
 GRID_REASON = "off_grid"
 
+# AC3 (issue #45, slice a) adds a fourth word outside the fixed vocabulary: the slot has already begun.
+# The two causes AC3 names answer 422, the other two keep the 409 issue #7 established for a slot the
+# shop could still honour later. `in_the_past` is not in `REFUSAL_REASONS`: a slot that has happened is
+# not a slot the shop cannot honour on this day, it is a slot that no longer exists.
+HTTP_STATUS = {"in_the_past": 422, "outside_opening_hours": 422}
+
 # How far the answer looks for alternatives: enough to cross a closed day, not a calendar.
 LOOKAHEAD_DAYS = 14
 DEFAULT_ALTERNATIVES = 8
@@ -88,6 +94,37 @@ def on_grid(moment: datetime, config: dict = SEED) -> bool:
     """True when `moment` is a grid point, measured from opening time of its own day."""
     grid = timedelta(minutes=config["grid_minutes"])
     return (moment - open_at(moment.date(), config)) % grid == timedelta(0)
+
+
+def quantize(moment: datetime, config: dict = SEED) -> datetime:
+    """A requested start as the shop can honour it: up to the next grid point (issue #45, AC1).
+
+    The grid is the shape of the set, not a refusal cause (see the module docstring), so a request that
+    lands between two grid points is *adjusted*: 14:07 becomes 14:15. The adjustment is measured from the
+    same origin `valid_start_times` uses — opening time, not the top of the hour — so the grid has one
+    definition in the codebase: `quantize` returns a point `on_grid` accepts for every input.
+    """
+    grid = timedelta(minutes=config["grid_minutes"])
+    offset = (moment - open_at(moment.date(), config)) % grid
+    return moment if offset == timedelta(0) else moment + (grid - offset)
+
+
+def in_the_past(moment: datetime, now: datetime) -> bool:
+    """AC3: a slot that has already begun cannot be booked, and the slot of the current moment has begun.
+
+    Inclusive on purpose. The shop commits a machine for a start, and at 09:00 the 09:00 slot is already
+    running: the customer cannot be booked into a slot whose first minute is the minute they are asking
+    in. That is the one refusal cause no alternative can fix — a slot that has happened cannot be moved —
+    so it is answered as 422, not as the 409 that answers a slot the shop can still honour later.
+
+    The tension with the board is stated rather than hidden: `GET /api/availability` lists the grid points
+    the day can honour, the point of `now` included (issue #8 pins `earliest_start == "09:00"` with the
+    clock at 09:00), while the booking path refuses that same point. The board answers "this day can hold
+    a cycle from here"; the booking answers "this slot can still be taken", and a slot already begun
+    cannot be. Reading the board as the first slot strictly later than `now` would move issue #8's pinned
+    test, so the two readings are left as they are and flagged for the human.
+    """
+    return moment <= now
 
 
 def valid_start_times(day: date, type_key: str, config: dict = SEED) -> list[datetime]:
