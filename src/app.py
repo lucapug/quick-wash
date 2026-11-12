@@ -488,6 +488,32 @@ class Application:
         if start is None:
             return 400, {"error": "start_required", "message": "Serve un orario di inizio"}
 
+        # AC3 (issue #45, slice a): the order the acceptance criteria read in.
+        #   1. a slot that has already begun is refused before anything else is decided. It is the one
+        #      refusal cause an alternative cannot fix — a slot that has happened cannot be moved — so it
+        #      is 422, not the 409 that answers a slot the shop can still honour later. The alternatives
+        #      are the next slots measured from `now`, because the requested hour is already gone.
+        #   2. AC1: an off-grid request is quantised up to the grid, so 14:07 books 14:15. An off-grid
+        #      request is adjusted, not refused: `off_grid` stays the helper's word for a slot the board
+        #      cannot offer, and it is never the answer to a booking request.
+        #   3. the fixed vocabulary of issue #7 names the cause, in its order; AC3's two causes (already
+        #      begun, outside opening hours) answer 422, the other two keep the 409.
+        if start_times.in_the_past(start, now):
+            reason, reference = "in_the_past", now
+        else:
+            reference = start = start_times.quantize(start, self.config)
+            reason = start_times.refusal_reason(start.date(), type_key, start, self.config)
+        if reason:
+            answer = start_times.next_valid_starts(reference.date(), type_key, reference, self.config)
+            self.telemetry.count("customer_blocked_total", journey=self.journey)
+            return start_times.HTTP_STATUS.get(reason, 409), {
+                "error": "slot_not_valid",
+                "reason": reason,
+                "requested": start_times.slot(reference),
+                "alternatives": answer["alternatives"],
+                "message": "Lo slot scelto non può essere rispettato",
+            }
+
         # R1, R2: the pure helper decides the slot and names the reason from the fixed vocabulary
         # (AC4), with the next valid alternatives earliest first, crossing to the next open day when
         # the day is exhausted (AC5, AC6).
@@ -636,8 +662,15 @@ class Application:
             "type": booking.get("type") or (self.db.one(
                 "SELECT type FROM machines WHERE id = ?", (booking["machine_id"],)) or {}).get("type"),
             "start": hhmm(start),
+            # The three names issue #45 (slice a of #11) writes on the record: `end` is the cycle end from
+            # the type's real duration (R1: 60/4, 75/6, 30/3), `token_count` is the type's tariff, the
+            # numeric code is `unlock_code`. The earlier spellings stay, so the same decision is never
+            # written twice and the seam answers both — never two values for the same fact.
+            "end": hhmm(parse(booking["end_time"])),
             "expected_end": hhmm(parse(booking["end_time"])),
+            "token_count": booking["tokens"],
             "tokens": booking["tokens"],
+            "unlock_code": booking["code"],
             "code": booking["code"],
             "state": booking["state"],
             "grace_window": {"from": hhmm(grace_from), "to": hhmm(grace_to)},

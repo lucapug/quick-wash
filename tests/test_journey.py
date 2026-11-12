@@ -72,7 +72,10 @@ def test_a_machine_reported_still_occupied_is_cleaned_and_the_customer_is_moved(
     client.post("/api/lock/reports", {"code": first["code"], "event": "cycle_finished"})
 
     client.clock.set(datetime(2026, 11, 12, 10, 15))
-    second = client.post("/api/bookings", {"type": "quick", "start": "10:15"}, headers=bruno.headers).json()["booking"]
+    # The slot has to be one that has not begun yet (issue #45, AC3): at 10:15 the 10:15 slot is
+    # already under way, so the first slot bruno can take is 10:30 — still the same machine, released
+    # by the turnover buffer at 10:10.
+    second = client.post("/api/bookings", {"type": "quick", "start": "10:30"}, headers=bruno.headers).json()["booking"]
     assert second["machine"] == first["machine"]  # the machine the report is about
 
     report = client.post("/api/lock/reports", {"machine": second["machine"], "event": "occupied"}, headers=bruno.headers)
