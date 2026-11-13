@@ -47,6 +47,14 @@ machine. Reassignment (R8) is its own issue, and the claim surface is the one pl
 the claim is admitted by a booking record, so it cannot rewrite the record that admits it, and the machine
 keeps exactly its entitled pre-report booking (issue #11, slice b2, AC3). The decision is `src/faults.py`, in one predicate, run by `apply_fault`.
 
+Issue #11, slice b1 is the persistence constraint and the loser path only: the UNIQUE
+`(machine_id, start_time)` index is what decides a race for one slot, the loser is answered 409 with the
+bounded set of alternatives (at most three, `src/rules.py`), and the fence is the pinned race test run
+against a real database on two real connections. Two things the test needs and the layer owns are recorded
+in `src/db.py`: one connection per request-thread, so two concurrent requests are two transactions, and one
+transaction per request with its snapshot taken at the moment the request begins, so the pre-check can name
+the same machine to both and the constraint is what refuses one of them.
+
 Issue #11, slice b2 is the maintenance invariant alone: a machine in `maintenance` can never be assigned a
 booking, so when it is the only candidate for a slot the seam answers 409 and nothing is created on it. The
 fence is the assignment step reading `src/availability.py` — the same predicate the public view answers on,
@@ -168,24 +176,29 @@ class Application:
             return 404, {"error": "not_found", "message": f"Percorso sconosciuto: {path}"}
         # R10 and AC 3: the two buffer hops are carried by time, not by a caller, so a request
         # resolves the elapsed buffers before answering. That is what makes the state read a live read.
-        self.resolve_buffers(self.clock.now())
-        try:
-            status, payload = getattr(self, f"handle_{name}")(body or {}, headers or {}, path)
-        except InvalidTransition as bad:
-            # R6: invalid transitions are rejected, never silently coerced. The attempted hop is in
-            # the body, and the machine keeps the state the table had declared for it.
-            payload = {"error": "invalid_transition", "from": bad.current, "to": bad.to,
-                       "transition": f"{bad.current} -> {bad.to}",
-                       "declared": sorted(machine_states.TRANSITIONS.get(bad.current, set())),
-                       "message": f"Transizione non valida: {bad.current} -> {bad.to}"}
-            if bad.event:
-                payload["event"] = bad.event
-            self.telemetry.record(method, path, 409, event=name)
-            return 409, payload
-        # The request line is all telemetry sees here: the path without its query, the status, the name of
-        # the handler and the journey. Never the body, which is where a credential arrives (AC3).
-        self.telemetry.record(method, path, status, event=name, journey=self.journey)
-        return status, payload
+        # R5 (issue #11, slice b1): the request reads one snapshot, its own transaction, opened before
+        # anything is decided and committed at its end. Two concurrent requests for the same slot then
+        # read the same state, so the guarantee is the UNIQUE (machine_id, start_time) index refusing the
+        # second insert — not a pre-check that could have been read before the other request wrote.
+        with self.db.snapshot():
+            self.resolve_buffers(self.clock.now())
+            try:
+                status, payload = getattr(self, f"handle_{name}")(body or {}, headers or {}, path)
+            except InvalidTransition as bad:
+                # R6: invalid transitions are rejected, never silently coerced. The attempted hop is in
+                # the body, and the machine keeps the state the table had declared for it.
+                payload = {"error": "invalid_transition", "from": bad.current, "to": bad.to,
+                           "transition": f"{bad.current} -> {bad.to}",
+                           "declared": sorted(machine_states.TRANSITIONS.get(bad.current, set())),
+                           "message": f"Transizione non valida: {bad.current} -> {bad.to}"}
+                if bad.event:
+                    payload["event"] = bad.event
+                self.telemetry.record(method, path, 409, event=name)
+                return 409, payload
+            # The request line is all telemetry sees here: the path without its query, the status, the name
+            # of the handler and the journey. Never the body, which is where a credential arrives (AC3).
+            self.telemetry.record(method, path, status, event=name, journey=self.journey)
+            return status, payload
 
     def pattern_route(self, method: str, path: str) -> str | None:
         """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs.
@@ -566,11 +579,14 @@ class Application:
             self.repo.next_code(now), tariff["tokens"], now,
         )
         if booking is None:
-            # R5: the persistence layer refused the slot, not a pre-check.
+            # R5: the persistence layer refused the slot, not a pre-check. The pre-check had named the
+            # same machine for the same slot to both requests, because both read the state as it was when
+            # the request began; the layer is what decided. The loser is answered with the bounded set of
+            # alternatives the decision from #47 preserves: at most three, and the refusal writes nothing.
             return 409, {
                 "error": "slot_taken",
                 "enforced_by": "persistence layer",
-                "alternatives": answer["alternatives"],
+                "alternatives": answer["alternatives"][:rules.LOSER_ALTERNATIVES],
                 "message": "Lo slot è stato assegnato a un altro cliente: scegli un orario alternativo",
             }
 

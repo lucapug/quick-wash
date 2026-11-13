@@ -2,7 +2,8 @@
 
 Race protection (R5) lives here as a UNIQUE constraint on (machine_id, start_time), not as a
 pre-check: a second insert for a machine and slot that is already committed fails and the caller
-answers with the alternatives.
+answers with the alternatives — the bounded set (at most three, `src/rules.py`) the decision from #47
+preserves for the loser.
 
 Machine rows store id, code, type, state, changed_at — no price, no duration, no venue: the tariff
 and the cycle length are read through the type registry in src/domain.py.
@@ -136,7 +137,15 @@ class Repository:
 
     def create_booking(self, machine_id: int, email: str, start: datetime, end: datetime,
                        code: str, tokens: int, now: datetime) -> dict | None:
-        """Insert under the UNIQUE constraint; None means the slot was taken (R5)."""
+        """Insert under the UNIQUE constraint; None means the slot was taken (R5).
+
+        This is where R5 is decided, and it is not a pre-check: the request that named the machine for the
+        slot had read the state as it was when its own request began (`src/db.py`), so two concurrent
+        requests can name the same machine for the same slot, and this insert is what refuses one of them —
+        the UNIQUE `(machine_id, start_time)` index on PostgreSQL, the write conflict on the same slot on the
+        file-backed fallback, which is the same fact read by the layer rather than by the application. The
+        refusal writes nothing: the caller's transaction is rolled back, so the loser leaves no row behind.
+        """
         try:
             self.db.execute(
                 "INSERT INTO bookings (machine_id, email, start_time, end_time, code, state, tokens, created_at) "
