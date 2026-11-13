@@ -15,6 +15,12 @@ from datetime import date, datetime, timedelta
 from src.config import SEED
 from src.domain import time as start_times
 
+# R5, the loser's answer (the decision #47 preserves): the persistence refusal carries a bounded set of
+# alternatives, at most three, so the customer can fix it in one tap. The bound is the loser path's, not
+# the general look-ahead of `src/domain/time.py`: the refusal the layer answers is the one that has to be
+# short enough to read at the machine.
+LOSER_ALTERNATIVES = 3
+
 
 def valid_start_times(type_key: str, config: dict = SEED, day: date | None = None) -> list[datetime]:
     """Every grid start time on `day` that a cycle of `type_key` can actually honour (R1, R2).

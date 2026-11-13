@@ -109,6 +109,10 @@ class SeamClient:
             self._httpx.close()
 
     def _request(self, method, path, payload, headers) -> Response:
+        # A path written without its leading slash — `api/bookings?machine=<code>`, the way the pinned race
+        # test of issue #11 slice b1 writes the machine-scoped read — is the same request: the base URL is
+        # joined with the path, not concatenated with it. httpx already joins; the stdlib fallback has to.
+        path = path if path.startswith("/") else f"/{path}"
         url = f"{self.base_url}{path}"
         sent = dict(headers or {})
         if payload is not None:
