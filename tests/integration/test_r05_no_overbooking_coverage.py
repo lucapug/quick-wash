@@ -10,7 +10,8 @@ So this file pins the three things AC2 states and the pinned test only reads:
 
 - **the bound**: the loser's 409 carries at most three alternatives — the decision #47 preserves — and every
   one of them is a slot of the type the loser asked for, on the grid, earliest first: bounded and valid, not
-  merely non-empty;
+  merely non-empty. The entries are read as the records issue #48 (slice c) defines for this answer, one
+  `start` and one `type` per alternative; the assertion is the same fact in the shape the UI of issue #22 reads.
 - **the refusal with the race removed from the way**: book the slot once so only one machine of the type is
   left as a candidate, then release the two requests together. Both pre-checks name that one machine,
   because each request reads the state as it was when its own request began, so the answer is the
@@ -56,8 +57,11 @@ def test_the_loser_is_answered_with_at_most_three_valid_alternatives(client, see
     alternatives = loser["alternatives"]
     assert alternatives, "AC2 asks for alternatives, not only for a refusal"
     assert len(alternatives) <= rules.LOSER_ALTERNATIVES, "at most three, the bound the decision preserves"
-    assert alternatives == sorted(alternatives), "the loser is offered them earliest first"
-    assert all(point in grid_of(client, "quick") for point in alternatives), \
+    # The shape issue #48 (slice c) defines for this answer: one record per alternative, `start` and `type`.
+    assert [a["start"] for a in alternatives] == sorted(a["start"] for a in alternatives), \
+        "the loser is offered them earliest first"
+    assert all(a["type"] == "quick" for a in alternatives), "from the type the loser asked for"
+    assert all(a["start"] in grid_of(client, "quick") for a in alternatives), \
         "every alternative is a grid slot of the type the loser asked for"
 
 
