@@ -55,6 +55,12 @@ in `src/db.py`: one connection per request-thread, so two concurrent requests ar
 transaction per request with its snapshot taken at the moment the request begins, so the pre-check can name
 the same machine to both and the constraint is what refuses one of them.
 
+Issue #11, slice c is the shape of that loser answer (`src/alternatives.py`): the bounded set, earliest
+first, of the type the request asked for, and only slots the customer can actually take — the same
+predicate the assignment step answers on, never `maintenance`, never inside a buffer, never a slot the type
+already owes a turn for, never a slot that would put her over R11. The record shape is scoped to the loser
+path: the calendar and no-machine refusals keep the slot strings the tests of issues R1+R2 and #11 b2 pin.
+
 Issue #11, slice b2 is the maintenance invariant alone: a machine in `maintenance` can never be assigned a
 booking, so when it is the only candidate for a slot the seam answers 409 and nothing is created on it. The
 fence is the assignment step reading `src/availability.py` — the same predicate the public view answers on,
@@ -75,7 +81,7 @@ writes nothing.
 
 from datetime import datetime, timedelta
 
-from src import availability, domain, entitlements, faults, machine_states, rules
+from src import alternatives, availability, domain, entitlements, faults, machine_states, rules
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import time as start_times
@@ -583,10 +589,15 @@ class Application:
             # same machine for the same slot to both requests, because both read the state as it was when
             # the request began; the layer is what decided. The loser is answered with the bounded set of
             # alternatives the decision from #47 preserves: at most three, and the refusal writes nothing.
+            # Issue #48 (slice c) is the shape of that answer: the bounded set, earliest first, of the type
+            # the loser asked for, and only slots she can actually take — `src/alternatives.py` reads the same
+            # predicate the assignment step answers on, so no listed slot is one the shop would refuse, and
+            # the count is the smaller of the bound and what R11 still lets her take that day.
             return 409, {
                 "error": "slot_taken",
                 "enforced_by": "persistence layer",
-                "alternatives": answer["alternatives"][:rules.LOSER_ALTERNATIVES],
+                "alternatives": alternatives.takeable(self.repo, self.config, type_key, start, now,
+                                                       remaining=limit - used),
                 "message": "Lo slot è stato assegnato a un altro cliente: scegli un orario alternativo",
             }
 
