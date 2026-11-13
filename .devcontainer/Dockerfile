@@ -27,4 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 USER node
 WORKDIR /workspace
 
+# Autostart runner al boot del container (approvato utente 13/11, checkpoint
+# §12.4): ENTRYPOINT detached/idempotente, skip sicuro se runner/.env assenti,
+# execa il CMD originale — la topologia del container non cambia.
+COPY .devcontainer/scripts/autostart-runner.sh /usr/local/bin/autostart-runner.sh
+ENTRYPOINT ["sh", "/usr/local/bin/autostart-runner.sh"]
+
 CMD ["sleep", "infinity"]
