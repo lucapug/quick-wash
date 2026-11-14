@@ -102,6 +102,12 @@ R03_NO_SESSION = (
 # tests/integration/test_refusal_alternatives_ux_coverage.py. The contradiction is recorded here as an xfail
 # so the gate runs green while it stays visible in the report: the supplied file is not changed and nothing
 # in src/ is bent to make it pass. When a human corrects one side of it, the entry below has to be removed.
+#
+# The same applies to the file issue #18 (R9) supplies: its first request is the slot of the current moment,
+# which issue #45 AC3 refuses as already begun, so the no-show it then describes cannot be created. The R9
+# facts are read back as outcomes in tests/integration/test_r09_no_show_block_coverage.py, where the first
+# no-show is created on a slot the shop can still take. What the two supplied files cannot both assert is
+# recorded below, and neither side is adjusted for it.
 # Issue #13 (the device boundary) supplies two tests. They run byte-identical and neither can be executed as
 # written, for reasons that are facts of the pack and not of the implementation — the criteria themselves are
 # asserted as outcomes in tests/integration/test_device_reports_coverage.py. What the file cannot do is reach
@@ -120,6 +126,16 @@ KNOWN_CONTRADICTIONS = {
     ("test_refusal_alternatives_ux.py", "test_409_lists_valid_alternatives_earliest_first_same_type"):
         "issue #48: R5 assigns per machine, so a second sequential request for the same type and slot is "
         "not a loser (201); and the seed its comment writes needs 3 machines of the type, conftest pins 2",
+    ("test_r10_turnover_and_cleaning.py", "test_turnover_buffer_of_10_minutes_blocks_the_machine"):
+        "issue #10 (R10): the supplied test reads a `machine` key on the availability slots, but the public "
+        "availability view is answered per machine type and never names a physical machine, a customer or a "
+        "code (issue #8, AC2 and AC6, pinned byte-identical by "
+        "tests/integration/test_availability_reasons.py::test_the_window_is_public_and_never_names_a_machine_a_customer_or_a_code). "
+        "Two supplied tests contradict each other on the shape of the public view, so the contradiction is "
+        "recorded rather than resolved by bending src/: the same criterion is read back as an outcome in "
+        "tests/integration/test_r10_turnover_and_cleaning_coverage.py (the machine inside the 10-minute buffer "
+        "is not counted free and the point the buffer covers carries `turnover_buffer`). If a human decides "
+        "the window may name a machine, this entry has to be removed and issue #8's AC2 re-opened.",
 
     # Issue #14 (R3): the file the issue supplies is executable in every other respect — the window is
     # inclusive on both bounds, a code is usable once, an unknown code answers `unknown_code`, a lost turn
@@ -133,6 +149,24 @@ KNOWN_CONTRADICTIONS = {
     ("test_r03_grace_and_redemption.py", "test_redemption_after_the_grace_window_expires_the_booking"): R03_NO_SESSION,
     ("test_r03_grace_and_redemption.py", "test_single_use_and_unknown_code"): R03_NO_SESSION,
 
+    # Issue #18 (R9): the file the issue supplies asserts the right outcomes — the counter, the block with
+    # its reason and its expiry on the customer's own view before any booking attempt, the 403, the booking
+    # that succeeds on the expiry date — and the seam answers each of them as written, read back in the
+    # coverage file. What it cannot do is create the first fact from inside itself: its first request is the
+    # slot of the moment the request arrives, which issue #45 AC3 refuses as already begun (422, pinned by
+    # tests/integration/test_booking_creation_happy_path.py), and its `advance(minutes=11)` closes a grace
+    # window only for a slot that has already begun, so the counter it then reads cannot be fed. The two
+    # files are both pinned, so the entry stands until a human corrects one side.
+    ("test_r09_no_show_block.py", "test_block_is_enforced_and_shown_with_reason_and_expiry"):
+        "issue #18: the supplied test books 09:00 with the clock at 09:00, the slot that has already begun "
+        "(issue #45, AC3), so the 422 tests/integration/test_booking_creation_happy_path.py pins for that "
+        "request is what answers and no booking exists to be no-showed; its advance(minutes=11) closes a "
+        "grace window only for a slot that has already begun, so the counter it reads cannot be fed from "
+        "inside the file. Every assertion it names is answered as supplied on a slot the shop can still "
+        "take — the counter, the block with its reason and its expiry on the customer's own view, the 403, "
+        "the booking that succeeds on the expiry date — read back in "
+        "tests/integration/test_r09_no_show_block_coverage.py. Both files are pinned, so the contradiction "
+        "needs a human on which side moves.",
     # The two halves of the same contradiction, each with the half that is its own: the first test asserts the
     # machine is still `unlocked` ninety minutes after the open, while the issue's own Decision puts the
     # 15-minute rule on every read of the machine state — so that read is the request that fires the event and

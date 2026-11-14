@@ -11,7 +11,9 @@ through the type registry — the same type always answers the same.
 The numbers themselves are seed data in src/config.py; this module is the shape that reads them.
 
 The package holds the time half of the domain as a submodule: `src/domain/time.py` is the pure
-helper for valid start times, the refusal vocabulary and the next valid alternatives (R1, R2).
+helper for valid start times, the refusal vocabulary and the next valid alternatives (R1, R2). The
+counter half is `src/domain/counters.py`: the rolling no-show window, the crossing and the block
+expiry (R9). Both are data in, data out — no repository, no clock object, no mock.
 """
 
 from dataclasses import dataclass

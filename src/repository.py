@@ -208,6 +208,25 @@ class Repository:
             "ORDER BY start_time", (machine_id,)
         )
 
+    def reports_on_machine(self, machine_id: int, email: str | None = None) -> list[dict]:
+        """The still-occupied reports a machine has been admitted on, in the order they arrived.
+
+        `bookings_on_machine` stops answering for a customer as soon as the reassignment moves their booking
+        off the machine, so the report itself is the record US35's repeat has to be read against: the
+        customer who said the machine was still full keeps the entitlement while the window that report
+        opened is running. The incident is what the report leaves behind, so it is the record, not a copy of
+        the rule.
+        """
+        sql = "SELECT * FROM incidents WHERE kind = 'cleaning_required'"
+        args = []
+        if machine_id is not None:
+            sql += " AND machine_id = ?"
+            args.append(machine_id)
+        if email:
+            sql += " AND email = ?"
+            args.append(email)
+        return self.db.rows(sql + " ORDER BY id", args)
+
     def set_booking_state(self, booking_id: int, state: str) -> None:
         self.db.execute("UPDATE bookings SET state = ? WHERE id = ?", (state, booking_id))
 
@@ -260,8 +279,14 @@ class Repository:
                         (email, iso(now), booking_id))
 
     def no_shows(self, email: str) -> list:
-        return [parse(row["occurred_at"]).date() for row in
-                self.db.rows("SELECT occurred_at FROM no_shows WHERE email = ?", (email,))]
+        """The customer's no-shows as the moments they happened, oldest first.
+
+        The counter is read on instants, not on calendar days: the block expires at the same local time,
+        seven days after the crossing (`src/domain/counters.py`), so the row keeps its time and is not
+        flattened to a date here. A pure helper receives data, so this is the data the seam hands it.
+        """
+        return [parse(row["occurred_at"]) for row in
+                self.db.rows("SELECT occurred_at FROM no_shows WHERE email = ? ORDER BY occurred_at", (email,))]
 
     def record_incident(self, kind: str, now: datetime, detail: str, email: str = None,
                         machine_id: int = None, booking_id: int = None) -> dict:

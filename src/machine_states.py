@@ -45,7 +45,10 @@ TRANSITIONS = {
     "reserved": {"unlocked", "available", "maintenance", "cleaning_required"},
     # `available` here is the `idle_open` release: the event is not a state, so its effect is the
     # declared hop out of `unlocked`.
-    "unlocked": {"running", "available", "maintenance"},
+    # `finished` is the device's own fact: the controller decides when a cycle ends (issue #15), and it
+    # can name that fact without having named the start first. R10 measures the turnover buffer from the
+    # moment the report arrives, so the hop the report names has to be declared, not refused.
+    "unlocked": {"running", "available", "maintenance", "finished"},
     # AC 6: `running → available` is not declared — a cycle must pass through `finished`.
     "running": {"finished"},
     "finished": {"available", "cleaning_required", "maintenance"},
@@ -65,6 +68,12 @@ BUFFER_HOPS = {
     "finished": "turnover_buffer_minutes",
     "cleaning_required": "cleaning_buffer_minutes",
 }
+
+# US35 repeat behaviour (addendum patch 2): a still-occupied report that lands on a machine already in
+# `cleaning_required` is accepted and the window restarts from the moment it arrives. It is not a hop —
+# the state stands and the buffer is measured again — so `TRANSITIONS` declares no self-entry for it and
+# the seam never coerces a transition that the table does not hold.
+REPEAT_REPORT = {"state": "cleaning_required", "restarts": "cleaning_buffer_minutes"}
 
 # Device reports: the event the controller sends, and the state it is allowed to cause.
 DEVICE_EVENTS = {
