@@ -81,7 +81,7 @@ writes nothing.
 
 from datetime import datetime, timedelta
 
-from src import alternatives, availability, domain, entitlements, faults, machine_states, rules
+from src import alternatives, availability, cancellation, domain, entitlements, faults, machine_states, rules
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import time as start_times
@@ -690,8 +690,9 @@ class Application:
 
         The refusal is at the seam, not in what the front-end shows: a caller who already holds the
         id is refused even on a booking a UI would render as clickable. Nothing is written for a
-        caller who is not entitled. The cancellation window (R4) is issue #15 — this slice carries the
-        entitlement, and here only the state that is already committed to a machine is refused.
+        caller who is not entitled. The window (R4, `src/cancellation.py`) is read after that gate, not
+        before it: a refusal of the entitlement is the answer to a caller who has no standing on the
+        booking at all, and the two statuses must stay distinguishable (issue #12).
         """
         booking = self.repo.booking_by_id(self.booking_id_of(path))
         who = self.customer(headers)
@@ -704,26 +705,40 @@ class Application:
         """The cancellation core, once: the same write behind the customer's cancel and the panel's.
 
         The entitlement is decided by the caller's gate before this runs, so the only thing left here is
-        the state test (R4 is issue #15) and the write itself. Splitting it out is what keeps the two
-        paths from answering differently for the same booking.
+        R4 — the window, read through `src/cancellation.py` — then the state test, then the write. The
+        window is read before the state test because it is the rule that refuses a late request, and both
+        refusals show the state as it already is: a refusal is a decision, not a write, so the booking
+        keeps its state and the machine keeps the state the booking holds it in (US46).
+
+        Splitting it out is what keeps the two paths from answering differently for the same booking.
         """
         now = self.clock.now()
-        if booking["state"] != "confirmed":
-            # US46: the state of a booking that can no longer be cancelled is shown. The window that
-            # decides it (R4) is issue #15; here the machine is already committed, so the state is the
-            # whole of the answer.
-            return 409, {"error": "not_cancellable", "state": booking["state"],
-                          "message": f"La prenotazione non è cancellabile: stato {booking['state']}"}
+        start = parse(booking["start_time"])
         self.trace(booking)
         machine = self.repo.machine_by_id(booking["machine_id"])
+        if not cancellation.may_cancel(start, now, self.config):
+            # The customer is blocked from an action she can still ask for: that is the event the one
+            # metric of the instrumented journey counts. It counts the refusal, not the booking: a turn
+            # given back before the cutoff is not a turn lost (AC7, R9).
+            self.telemetry.count("customer_blocked_total", journey=self.journey)
+            return 409, cancellation.refusal(booking, machine, self.config, now, start,
+                                             cancellation.WINDOW_REFUSED)
+        if booking["state"] not in cancellation.CANCELLABLE_STATES:
+            # US46: the state of a booking that can no longer be cancelled is shown. The window has already
+            # been read; here the machine is committed to a turn, so the state is the whole of the answer.
+            return 409, cancellation.refusal(booking, machine, self.config, now, start, cancellation.STATE_REFUSED)
         self.repo.set_booking_state(booking["id"], "cancelled")
         if machine is not None and machine["state"] == "reserved":
-            # US45: the slot becomes bookable by others at once.
+            # US45: the slot becomes bookable by others at once. No buffer is charged for a cancellation —
+            # the buffer is the hop that follows a cycle actually run (R10), and this is the declared hop
+            # `reserved -> available`, taken at the moment of the request.
             self.transition(machine["id"], "available", now)
+        # R9, AC7: nothing here touches the no-show counter. The incident is the cancellation itself.
         self.repo.record_incident("cancellation", now, "cancelled at the seam", booking["email"],
                                   booking["machine_id"], booking["id"])
         # The answer is the booking as the row is now, not as it was when the request arrived.
         return 200, {"outcome": "cancelled", "booking": self.booking_view(self.repo.booking_by_id(booking["id"])),
+                      "cutoff_minutes": cancellation.cutoff_minutes(self.config),
                       "message": "Prenotazione cancellata: lo slot torna disponibile"}
 
     def booking_view(self, booking, machine_code=None):

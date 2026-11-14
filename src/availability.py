@@ -62,7 +62,9 @@ BUFFER_REASON = {"turnover_buffer_minutes": "turnover_buffer", "cleaning_buffer_
 OPEN_STATES = ("available", "finished", "cleaning_required")
 
 # The states in which a booking still owes a turn to its customer, so the point is protected (R5).
-HELD_BOOKING_STATES = ("confirmed", "unlocked", "running")
+# The same set `src/machine_states.py` names, so the predicate the public view answers on and the index
+# the persistence layer enforces read one fact and not two copies of it.
+HELD_BOOKING_STATES = machine_states.HOLDING_STATES
 
 
 def hhmm(moment) -> str:
