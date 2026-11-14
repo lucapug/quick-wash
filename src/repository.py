@@ -1,9 +1,12 @@
 """Repository: the persistence layer the seam talks to.
 
-Race protection (R5) lives here as a UNIQUE constraint on (machine_id, start_time), not as a
-pre-check: a second insert for a machine and slot that is already committed fails and the caller
-answers with the alternatives — the bounded set (at most three, `src/rules.py`) the decision from #47
-preserves for the loser.
+Race protection (R5) lives here as a UNIQUE on `(machine_id, start_time)`, not as a pre-check: a second
+insert for a machine and slot that is already committed fails and the caller answers with the
+alternatives — the bounded set (at most three, `src/rules.py`) the decision from #47 preserves for the
+loser. The constraint is scoped to the bookings that still hold a turn (`src/machine_states.HOLDING_STATES`),
+which is the one fact R4 and R5 share: a cancelled booking has given its turn back, so the same machine and
+the same slot are bookable again at once (issue #15, AC3), and the fence is still the index deciding, not a
+pre-check the application could have read stale.
 
 Machine rows store id, code, type, state, changed_at — no price, no duration, no venue: the tariff
 and the cycle length are read through the type registry in src/domain.py.
@@ -20,7 +23,7 @@ reconstructed from the email.
 import json
 from datetime import datetime
 
-from src import identity
+from src import identity, machine_states
 from src.config import SEED
 
 TABLES = {
@@ -46,10 +49,10 @@ TABLES = {
     "bookings": (
         "id INTEGER PRIMARY KEY, machine_id INTEGER NOT NULL, email TEXT NOT NULL, start_time TEXT NOT NULL, "
         "end_time TEXT NOT NULL, code TEXT UNIQUE NOT NULL, state TEXT NOT NULL, tokens INTEGER NOT NULL, "
-        "redeemed_at TEXT, created_at TEXT NOT NULL, UNIQUE (machine_id, start_time)",
+        "redeemed_at TEXT, created_at TEXT NOT NULL",
         "id SERIAL PRIMARY KEY, machine_id INTEGER NOT NULL, email TEXT NOT NULL, start_time TEXT NOT NULL, "
         "end_time TEXT NOT NULL, code TEXT UNIQUE NOT NULL, state TEXT NOT NULL, tokens INTEGER NOT NULL, "
-        "redeemed_at TEXT, created_at TEXT NOT NULL, UNIQUE (machine_id, start_time)",
+        "redeemed_at TEXT, created_at TEXT NOT NULL",
     ),
     "no_shows": (
         "id INTEGER PRIMARY KEY, email TEXT NOT NULL, occurred_at TEXT NOT NULL, booking_id INTEGER",
@@ -61,6 +64,16 @@ TABLES = {
         "id SERIAL PRIMARY KEY, kind TEXT NOT NULL, email TEXT, machine_id INTEGER, booking_id INTEGER, "
         "created_at TEXT NOT NULL, detail TEXT NOT NULL",
     ),
+}
+
+# R5 read together with R4: the slot is unique among the bookings that still hold a turn. Written as an
+# index rather than as a table-level UNIQUE so the state can be part of the rule on both backends, and
+# built from the one set `src/machine_states.py` names, so the view, the layer and the rule read the same
+# fact. `create_booking` is still the thing that decides the race; nothing here is a pre-check.
+HOLDING_SQL = ", ".join(f"'{state}'" for state in machine_states.HOLDING_STATES)
+INDEXES = {
+    "bookings_slot": f"CREATE UNIQUE INDEX bookings_slot ON bookings (machine_id, start_time) "
+                     f"WHERE state IN ({HOLDING_SQL})",
 }
 
 
@@ -82,6 +95,8 @@ class Repository:
             self.db.execute(f"DROP TABLE IF EXISTS {name}")
             dialect = 0 if self.db.backend == "sqlite" else 1
             self.db.execute(f"CREATE TABLE {name} ({variants[dialect]})")
+        for sql in INDEXES.values():
+            self.db.execute(sql)
         self.seed()
 
     def seed(self) -> None:
@@ -137,14 +152,17 @@ class Repository:
 
     def create_booking(self, machine_id: int, email: str, start: datetime, end: datetime,
                        code: str, tokens: int, now: datetime) -> dict | None:
-        """Insert under the UNIQUE constraint; None means the slot was taken (R5).
+        """Insert under the scoped UNIQUE index; None means the slot was taken (R5).
 
         This is where R5 is decided, and it is not a pre-check: the request that named the machine for the
         slot had read the state as it was when its own request began (`src/db.py`), so two concurrent
         requests can name the same machine for the same slot, and this insert is what refuses one of them —
-        the UNIQUE `(machine_id, start_time)` index on PostgreSQL, the write conflict on the same slot on the
-        file-backed fallback, which is the same fact read by the layer rather than by the application. The
-        refusal writes nothing: the caller's transaction is rolled back, so the loser leaves no row behind.
+        the `bookings_slot` index on PostgreSQL, the write conflict on the same slot on the file-backed
+        fallback, which is the same fact read by the layer rather than by the application. The refusal writes
+        nothing: the caller's transaction is rolled back, so the loser leaves no row behind. The index covers
+        the bookings that still hold a turn, so a slot a customer has cancelled is not a slot the layer still
+        owes to her (issue #15, AC3): the next request inserts, and the record of the cancelled turn stays
+        readable as the state the customer is shown.
         """
         try:
             self.db.execute(
