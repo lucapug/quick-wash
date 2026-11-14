@@ -39,6 +39,22 @@ background scheduler; `running` is never an outcome of this path, because a cycl
 `cycle_started` report. The code has no email or SMS transport, never appears in a public view and never
 enters a log line.
 
+The device boundary (issue #13): the simulator is in-process (`src/simulator.py`), not a service, and it has
+exactly two calls — the redemption and one report each. It holds only what it observed at the machine, so it
+is not a second writer of the domain: the only writer of a machine state is `Application.transition`, reading
+the R6 table. `running` and `finished` are the outcome of a report, never of a timer and never of an
+assumption that tokens were inserted, and `finished` lands at the moment the report names it, not at
+`start + cycle_minutes`. `idle_open` is evaluated on that boundary twice: at report time, and at every read of
+the machine state, from the recorded open (`unlocked_at`, the instant the redemption recorded the machine as
+open) through `machine_states.idle_open_due` — the same predicate the device reads. That is the decision the
+issue signs: the spec forbids mocking the clock inside a unit test, so the 15-minute rule has to be observable
+from the seam, and a read is the request that can notice it without a scheduler. The closure it leaves is the
+record the pack writes: booking `closed`, machine released through the declared hop, incident, and the no-show
+on the counter of the customer the turn belongs to — `expired` stays R3's word for a code that never worked
+inside its window, which is a different fact and a different test. Every device call carries the journey trace
+(issue #25): the redemption answer names it, the device carries it back on each report, and `trace_guard` is
+where a call that carries a foreign one is refused before anything is written.
+
 The booking surface of one booking (issue #10, slice a): `GET /api/bookings/<id>` and
 `POST /api/bookings/<id>/cancel` are patterns, not extra contract paths, and they are entitlements —
 the customer's own booking, or the owner panel. The decision is `src/entitlements.py`: 403 for a wrong
@@ -349,15 +365,36 @@ class Application:
         """
         return 200, self.telemetry.view()
 
-    def trace(self, booking) -> str | None:
+    def trace(self, booking, carried=None) -> str | None:
         """The journey the request belongs to (docs/spec.md, Observability shape): the internal booking
         id, never the customer and never a code. `src/telemetry.py` turns it into the trace identifier
         shared by every log line and every metric attached to that journey.
+
+        The device boundary carries that identifier instead of inventing one: the redemption answer names
+        it, the simulator keeps it and every report it sends carries it back (issue #13, AC 7). The domain
+        still resolves it from the booking the call is about, so a device cannot attach its call to a
+        journey it does not belong to; `trace_guard` is where the two readings are compared.
         """
         if booking is None:
-            return None
+            self.journey = carried
+            return carried
         self.journey = self.telemetry.journey(booking["id"])
         return self.journey
+
+    def trace_guard(self, body, booking) -> tuple[int, dict] | None:
+        """AC 7 (issue #13): a device call that carries a trace must carry the one this booking has.
+
+        The identifier is not a credential, so it is the one field a device may carry and the seam may
+        read back. A call that names a journey other than the one it belongs to would split the trace the
+        observability shape asks for, so it is refused with the mismatch in the body — and nothing is
+        written, because a refusal on this path never reaches the state machine.
+        """
+        resolved = self.trace(booking)
+        carried = (body or {}).get("trace")
+        if carried and resolved and carried != resolved:
+            return 400, {"error": "trace_not_this_journey", "carried": carried, "journey": resolved,
+                          "message": "Il identificatore del percorso non è quello di questa prenotazione"}
+        return None
 
     def who_is_asking(self, headers) -> dict:
         """Who the seam is answering: a customer with a session, or the observer without one.
@@ -879,7 +916,11 @@ class Application:
         now = self.clock.now()
         window = rules.grace_window(parse(booking["start_time"]), self.config)
         machine = self.repo.machine_by_id(booking["machine_id"])
-        self.trace(booking)
+        # AC 7: the redemption is the device call that names the journey. Everything the device reports
+        # after it is attached to the same trace, because the device carries the identifier back.
+        mismatch = self.trace_guard(body, booking)
+        if mismatch is not None:
+            return mismatch
 
         if booking["state"] == "confirmed" and not rules.in_window(now, window, self.config):
             if now < window[0]:
@@ -913,6 +954,7 @@ class Application:
         self.repo.set_booking_state(booking["id"], "unlocked")
         self.repo.record_open(booking["id"], now)
         return 200, {"outcome": "unlocked", "machine": machine["code"], "tokens_required": booking["tokens"],
+                      "trace": self.journey,
                       "grace_window": {"from": hhmm(window[0]), "to": hhmm(window[1])}}
 
     def handle_report(self, body, headers, path=None):
@@ -930,7 +972,9 @@ class Application:
         if booking is None:
             # A device report is about a machine: the booking it belongs to is the one still attached.
             booking = self.repo.open_booking(machine["id"])
-        self.trace(booking)
+        mismatch = self.trace_guard(body, booking)
+        if mismatch is not None:
+            return mismatch
 
         # The two reports that name a customer are entitlement-gated (R7).
         if event == "fault":
@@ -961,30 +1005,79 @@ class Application:
             free_at = now + timedelta(minutes=self.config["turnover_buffer_minutes"])
             outcome["turnover_minutes"] = self.config["turnover_buffer_minutes"]
             outcome["bookable_from"] = hhmm(free_at)
+        outcome["trace"] = self.journey           # AC 7: the report is read on the journey it belongs to
         return 200, outcome
 
-    def handle_idle_open(self, machine, booking, now):
-        """AC 5: `idle_open` is an event, not a state — the table has no `idle_open` key. It closes the
-        booking, releases the machine through the declared hop `unlocked -> available`, counts the
-        no-show (R9) and records the incident."""
-        if booking is None:
-            return 404, {"outcome": "unknown_code", "message": "Nessuna prenotazione aperta su questa macchina"}
+    def unlocked_at(self, booking) -> datetime | None:
+        """The recorded open: the instant the device's redemption recorded the machine as open.
+
+        `bookings.redeemed_at` is the device fact the repository keeps (issue #14) and it is the instant the
+        15-minute rule is measured from — the `unlocked_at` the decision names. A redemption refused by the
+        grace window is still an open, so the rule is measured from the fact the device produced, not from
+        the code's validity. Nothing here is a credential: it is a timestamp.
+        """
+        return parse(booking["redeemed_at"]) if booking and booking["redeemed_at"] else None
+
+    def close_idle_open(self, machine, booking, now) -> dict:
+        """The four facts the event leaves, in one place: booking closed, machine released, no-show, incident.
+
+        `docs/spec.md` says the booking is *closed*: `expired` is R3's word for a code that never worked
+        inside its window (issue #14, AC3) and it is not what an open machine that never started a cycle
+        leaves behind — here the code did work, the customer did open the machine, and the turn was then not
+        honoured. The state guard makes the fact one: the booking the rule can reach is the one still
+        attached to the machine, so the same lost turn read twice is not written twice and the R9 counter is
+        not moved twice.
+        """
         self.trace(booking)
-        if machine["state"] != "unlocked":
-            raise InvalidTransition(machine["state"], "available", event="idle_open")
-        opened = parse(booking["redeemed_at"]) if booking["redeemed_at"] else None
-        idle = now - opened if opened else timedelta(0)
-        if idle < timedelta(minutes=self.config["idle_open_minutes"]):
-            return 409, {"error": "too_early", "event": "idle_open",
-                          "message": "idle_open richiede almeno 15 minuti dall'apertura",
-                          "idle_minutes": int(idle.total_seconds() // 60)}
         self.repo.set_booking_state(booking["id"], "closed")
         self.transition(machine["id"], "available", now, event="idle_open")
         self.repo.record_no_show(booking["email"], now, booking["id"])
-        incident = self.repo.record_incident("idle_open", now, "machine opened, cycle never started",
-                                             booking["email"], machine["id"], booking["id"])
+        return self.repo.record_incident("idle_open", now, "machine opened, cycle never started",
+                                         booking["email"], machine["id"], booking["id"])
+
+    def resolve_idle_open(self, machine, now) -> dict | None:
+        """The decision (issue #13): the rule is evaluated at report time and at every read of the state.
+
+        The spec forbids mocking the clock inside a unit test, so the outcome of the 15-minute rule has to
+        come from the seam. Evaluating it on the read is what makes it observable without a scheduler: the
+        same read that shows the machine is the read that notices the recorded open has reached the bound,
+        exactly as R3's expiry is evaluated at redemption and on any read of the booking (issue #14,
+        decision 2). The device reads it the same way, on the same predicate
+        (`machine_states.idle_open_due`), so the boundary and the domain cannot disagree about the bound.
+        """
+        if machine["state"] != "unlocked":
+            return None
+        booking = self.repo.open_booking(machine["id"])
+        if booking is None or not machine_states.idle_open_due(self.unlocked_at(booking), now, self.config):
+            return None
+        self.close_idle_open(machine, booking, now)
+        return self.repo.machine_by_id(machine["id"])
+
+    def handle_idle_open(self, machine, booking, now):
+        """AC 4 (issue #13): `idle_open` is an event, not a state — the table has no `idle_open` key. It
+closes the booking, releases the machine through the declared hop `unlocked -> available`, counts the no-show
+(R9) and records the incident. On the bound it is accepted: the fifteenth minute is inside the rule, the
+fourteenth is not, and the same predicate decides the device's report and the read. A report on a machine the
+rule cannot reach — no booking attached, or a state other than `unlocked` — answers 404 or the attempted hop,
+and writes nothing.
+        """
+        if booking is None:
+            # AC 4 as the reviewer reads it: the report names a machine, and a machine with no booking the
+            # rule can close is not a lost turn — it is a machine the device is standing in front of for no
+            # reason. 404, and nothing written: no state hop, no incident, no counter.
+            return 404, {"outcome": "unknown_code", "error": "booking_not_found", "machine": machine["code"],
+                          "message": "Nessuna prenotazione aperta su questa macchina"}
+        if machine["state"] != "unlocked":
+            raise InvalidTransition(machine["state"], "available", event="idle_open")
+        opened = self.unlocked_at(booking)
+        if not machine_states.idle_open_due(opened, now, self.config):
+            idle = now - opened if opened else timedelta(0)
+            return 409, {"error": "too_early", "event": "idle_open",
+                          "message": f"idle_open richiede almeno {self.config['idle_open_minutes']} minuti dall'apertura",
+                          "idle_minutes": int(idle.total_seconds() // 60)}
+        incident = self.close_idle_open(machine, booking, now)
         return 200, {"outcome": "closed", "machine": machine["code"], "incident": incident["kind"],
-                     "message": "Turno perso: macchina liberata"}
+                      "trace": self.journey, "message": "Turno perso: macchina liberata"}
 
     def handle_fault(self, body, headers, now, path=None):
         """The same entitlement as the booking surface, read through the report path.
@@ -1349,6 +1442,10 @@ class Application:
         machine = self.repo.machine(code)
         if machine is None:
             return 404, {"error": "unknown_machine", "message": "Macchina sconosciuta"}
+        # The decision of issue #13: the 15-minute rule is evaluated on this read, from the recorded open.
+        # Nothing is a scheduler here — the read is the request that notices the bound, and it is the same
+        # predicate the device reports on (`src/simulator.py`), so the two cannot drift.
+        machine = self.resolve_idle_open(machine, self.clock.now()) or machine
         view = domain.machine_view(machine, self.config)
         buffer, bookable_from = self.buffer_of(machine, self.clock.now())
         return 200, {**view, "machine": machine["code"], "state": machine["state"],

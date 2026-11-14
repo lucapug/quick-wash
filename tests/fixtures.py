@@ -102,6 +102,20 @@ R03_NO_SESSION = (
 # tests/integration/test_refusal_alternatives_ux_coverage.py. The contradiction is recorded here as an xfail
 # so the gate runs green while it stays visible in the report: the supplied file is not changed and nothing
 # in src/ is bent to make it pass. When a human corrects one side of it, the entry below has to be removed.
+# Issue #13 (the device boundary) supplies two tests. They run byte-identical and neither can be executed as
+# written, for reasons that are facts of the pack and not of the implementation — the criteria themselves are
+# asserted as outcomes in tests/integration/test_device_reports_coverage.py. What the file cannot do is reach
+# them: it books and reads with no session, while AC7 of issue #9 pins an anonymous booking request at 401
+# (docs/spec.md excludes anonymous booking because it makes no-shows untraceable and R9 impossible), and it
+# reads the customer's counter on `GET /api/customers/me`, which is not one of the eight contract paths
+# tests/conftest.py pins — the counter is observable as the R9 block on `GET /api/bookings`.
+DEVICE_REPORTS_SEAM = (
+    "issue #13: the supplied file books and reads a booking with no session, while AC7 of issue #9 pins an "
+    "anonymous booking request at 401, and it reads the customer's no-show counter on `GET /api/customers/me`, "
+    "which is not one of the eight contract paths tests/conftest.py pins (the counter is observable as the R9 "
+    "block on `GET /api/bookings`)"
+)
+
 KNOWN_CONTRADICTIONS = {
     ("test_refusal_alternatives_ux.py", "test_409_lists_valid_alternatives_earliest_first_same_type"):
         "issue #48: R5 assigns per machine, so a second sequential request for the same type and slot is "
@@ -118,6 +132,25 @@ KNOWN_CONTRADICTIONS = {
     ("test_r03_grace_and_redemption.py", "test_code_works_from_10_minutes_before_start"): R03_NO_SESSION,
     ("test_r03_grace_and_redemption.py", "test_redemption_after_the_grace_window_expires_the_booking"): R03_NO_SESSION,
     ("test_r03_grace_and_redemption.py", "test_single_use_and_unknown_code"): R03_NO_SESSION,
+
+    # The two halves of the same contradiction, each with the half that is its own: the first test asserts the
+    # machine is still `unlocked` ninety minutes after the open, while the issue's own Decision puts the
+    # 15-minute rule on every read of the machine state — so that read is the request that fires the event and
+    # answers `available`. The second is the fence the issue corrected on 12/11 (the #46 precedent: the AC wins
+    # over a legacy pinned value): its `closed` is what the pack records for an idle_open closure — `expired`
+    # is R3's word for a code that never worked inside its window, and here the code did work — so only the two
+    # access facts above keep it from running, and the rule it names is asserted as outcomes in
+    # tests/integration/test_device_reports_coverage.py.
+    ("test_device_reports.py", "test_running_comes_from_the_device_not_from_a_timer"): (
+        f"{DEVICE_REPORTS_SEAM}; and its second half contradicts the issue's Decision — the rule is evaluated "
+        "at report time and at every read of the machine state, so the read ninety minutes after the open "
+        "answers `available`, not `unlocked`. The rule it names (`running` comes from `cycle_started`, never "
+        "from a timer) is asserted as outcomes in tests/integration/test_device_reports_coverage.py"
+    ),
+    ("test_device_reports.py", "test_idle_open_after_15_minutes_releases_the_machine_and_records_an_incident"): (
+        f"{DEVICE_REPORTS_SEAM}. The closure, the release, the incident and the counter it asserts are asserted "
+        "as outcomes in tests/integration/test_device_reports_coverage.py"
+    ),
 }
 
 

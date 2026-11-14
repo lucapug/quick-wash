@@ -15,10 +15,14 @@ pack plus the record, the team spec and the tracker until the root index gains a
 Two names are deliberately absent from `STATES`:
 
 - `idle_open` is an **event**, not a state: `unlocked` with no `cycle_started` inside 15 minutes
-  closes the booking, releases the machine (`unlocked → available`) and records an incident.
+  closes the booking, releases the machine (`unlocked → available`) and records an incident. The rule is
+  one predicate (`idle_open_due`) on the recorded `unlocked_at`, evaluated at report time and at every
+  read of the machine state — never by a scheduler, so the outcome stays observable through the seam.
 - `expired` is a terminal state of a **booking**, never of a machine. A booking that expires leaves
   its machine `available`.
 """
+
+from datetime import datetime, timedelta
 
 STATES = ("available", "reserved", "unlocked", "running", "finished", "cleaning_required", "maintenance")
 
@@ -85,6 +89,22 @@ HOLDING_STATES = ("confirmed", "unlocked", "running")
 
 # The names that must never appear as a machine state.
 NOT_STATES = ("idle_open", "expired")
+
+
+def idle_open_due(opened_at: datetime | None, now: datetime, config: dict) -> bool:
+    """The 15-minute rule as one predicate, in the same place the table is.
+
+    `opened_at` is the moment the device's redemption recorded the open (`bookings.redeemed_at`, written
+    by `src/repository.py`): the instant the machine was opened, which is what `idle_open` is measured
+    from. The predicate takes data, not a row and not a clock object, so it is read the same way by the
+    seam at report time, by the seam at every read of the machine state, and by the device itself
+    (`src/simulator.py`) — one rule, three readers, no drift, and no scheduler behind it.
+
+    Inclusive on the bound: the report at the fifteenth minute is inside the rule, the fourteenth is not.
+    """
+    if opened_at is None:
+        return False
+    return now - opened_at >= timedelta(minutes=config["idle_open_minutes"])
 
 
 def declares(current: str, to: str) -> bool:

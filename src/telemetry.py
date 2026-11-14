@@ -77,8 +77,17 @@ class Telemetry:
         self.metrics = {"customer_blocked_total": 0}
 
     def journey(self, key) -> str:
-        """The trace identifier for one journey, shared by every line and metric attached to it."""
+        """The trace identifier for one journey, shared by every line and metric attached to it.
+
+        Idempotent, because the identifier is resolved once and then carried: `Application.trace` resolves it
+        from the booking, the application hands it back to the recorder for the lines of the same journey, and
+        the device carries it from the redemption answer to every report it sends (issue #13, AC 7). Hashing a
+        value that is already an identifier would name a second journey for the same booking, so an identifier
+        is taken as it is and a key — the internal booking id, or the request line — is hashed to one.
+        """
         name = str(key)
+        if name.startswith("t-"):
+            return name
         if name not in self.journeys:
             self.journeys[name] = "t-" + hashlib.sha256(name.encode()).hexdigest()[:10].translate(LETTERS)
         return self.journeys[name]

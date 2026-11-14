@@ -159,15 +159,19 @@ def test_a_redemption_never_starts_a_cycle_and_no_timer_does(client, seed, clock
     _, booking = book(client, "odi@example.com", "standard", "10:00")
     clock.set("10:05")
     assert outcome(client, booking["code"])["outcome"] == "unlocked"
-    assert client.get(f"/api/machines/{booking['machine']}").json()["state"] == "unlocked"
+    machine = booking["machine"]
+    assert client.get(f"/api/machines/{machine}").json()["state"] == "unlocked"
 
-    # Past the end of the cycle with no `cycle_started` report nothing has moved: the system never
-    # assumes tokens were inserted, and no timer drives the state.
-    clock.set("11:05")
-    assert client.get(f"/api/machines/{booking['machine']}").json()["state"] == "unlocked"
+    # Inside the bound issue #13 sets for `idle_open`, the read shows exactly what the device has reported:
+    # nothing. The system never assumes tokens were inserted, and no timer drives the state.
+    clock.set("10:14")
+    assert client.get(f"/api/machines/{machine}").json()["state"] == "unlocked"
     read = client.get(f"/api/bookings/{booking['id']}", headers=client.session("odi@example.com")).json()
     assert read["state"] == "unlocked", "the booking is open, not running: no timer moved it"
 
-    # The report is what moves it, and only through the declared hop.
-    client.post("/api/lock/reports", json={"machine": booking["machine"], "event": "cycle_started"})
-    assert client.get(f"/api/machines/{booking['machine']}").json()["state"] == "running"
+    # The report is what moves it, and only through the declared hop. Past the nominal end of the cycle the
+    # state is still the device's alone, because no report named a finish.
+    client.post("/api/lock/reports", json={"machine": machine, "event": "cycle_started"})
+    assert client.get(f"/api/machines/{machine}").json()["state"] == "running"
+    clock.set("11:05")            # 10:00 + the type's 60 minutes: nothing moved it that the device did not name
+    assert client.get(f"/api/machines/{machine}").json()["state"] == "running"
