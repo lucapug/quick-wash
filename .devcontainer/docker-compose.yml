@@ -12,6 +12,7 @@ services:
       - egress
 
   app:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: .devcontainer/Dockerfile
