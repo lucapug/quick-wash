@@ -39,6 +39,16 @@ def grace_window(start: datetime, config: dict = SEED) -> tuple[datetime, dateti
     return start - grace, start + grace
 
 
+def in_window(now: datetime, window: tuple[datetime, datetime], config: dict = SEED) -> bool:
+    """R3 with both bounds inclusive: the window is `[from, to]`, and an instant on either bound is inside.
+
+    Inclusive is what the rule says and what the test asserts — the code works at the tenth minute before
+    start and at the tenth minute after it. One predicate, so the redemption and the read of a booking
+    answer on the same boundary and cannot drift.
+    """
+    return window[0] <= now <= window[1]
+
+
 def no_show_block(no_shows: list[date], today: date, config: dict = SEED) -> date | None:
     """Block expiry date when the no-show counter reaches the threshold (R9).
 

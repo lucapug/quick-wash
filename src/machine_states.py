@@ -84,6 +84,14 @@ DEVICE_EVENTS = {
 BOOKING_STATES = ("confirmed", "unlocked", "running", "finished", "closed", "cancelled", "expired")
 BOOKING_TERMINAL_STATES = ("closed", "cancelled", "expired")
 
+# The booking states that still hold a turn on a machine. One set, read by two things that must not
+# disagree: the public view answers `free` on its complement (issue #8, AC7), and the persistence layer
+# enforces R5 on it — the slot is unique among the bookings that still hold a turn. A booking in
+# `cancelled` has given its turn back rather than lost it, so the same machine and the same slot are
+# bookable again at once (issue #15, AC3): that is why the index is scoped to this set and not to the
+# whole table, and it is still the layer deciding, never a pre-check.
+HOLDING_STATES = ("confirmed", "unlocked", "running")
+
 # The names that must never appear as a machine state.
 NOT_STATES = ("idle_open", "expired")
 

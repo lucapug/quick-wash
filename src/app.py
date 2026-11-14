@@ -29,6 +29,16 @@ caller is no longer a customer that can book — it is the reviewer's observer, 
 The telemetry read is the reviewer's view of the request lines; the recorder itself (`src/telemetry.py`)
 is what keeps a credential out of them (AC3).
 
+The unlock code and its grace window (issue #14, R3): the code is the booking's own numeric code, six
+digits as the machine keypad reads it, tied to one row and redeemed once on `POST /api/lock/redeem` inside
+`[start - 10, start + 10]`, inclusive on both bounds. The four outcomes of that path are fixed:
+`unlocked`, `expired`, `already_redeemed`, `unknown_code`, and the last two read as the customer's own
+situation — a typo, a lost turn — not as a system failure. Expiry is evaluated at redemption and on any
+read of the booking, which is what R3's observable outcome is and what keeps the rule testable without a
+background scheduler; `running` is never an outcome of this path, because a cycle is the device's
+`cycle_started` report. The code has no email or SMS transport, never appears in a public view and never
+enters a log line.
+
 The booking surface of one booking (issue #10, slice a): `GET /api/bookings/<id>` and
 `POST /api/bookings/<id>/cancel` are patterns, not extra contract paths, and they are entitlements —
 the customer's own booking, or the owner panel. The decision is `src/entitlements.py`: 403 for a wrong
@@ -96,7 +106,7 @@ restarts it (US35) — the state stands, so no hop is attempted and the table de
 
 from datetime import datetime, timedelta
 
-from src import alternatives, availability, domain, entitlements, faults, machine_states, rules
+from src import alternatives, availability, cancellation, domain, entitlements, faults, machine_states, rules
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import time as start_times
@@ -126,6 +136,13 @@ SEED_WRITE = {"POST /api/machines": "create_machine"}
 # the docs mirror can be checked against each other. `Application.transition` is the only writer of a
 # machine state and it consults that table for every hop.
 PER_MACHINE_READ = ("GET", "/api/machines/")
+
+# R3 (issue #14): the outcomes the lock API answers a keypad entry with. Exactly these four.
+REDEMPTION_OUTCOMES = ("unlocked", "expired", "already_redeemed", "unknown_code")
+
+# The booking states that mean the code has already been spent at the keypad (US26). `expired` is not one
+# of them: a code that died with its window was never used, it is dead (issue #14, AC3).
+SPENT_STATES = ("unlocked", "running", "finished")
 
 # Three reads are patterns, not contract paths, so `ROUTES` stays exactly the eight entries
 # tests/test_seam.py pins: the state of one machine (issue #6, AC8), the verification of a one-time
@@ -646,10 +663,11 @@ class Application:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
         now = self.clock.now()
         today = now.date()
-        used = len([row for row in self.repo.bookings_for(who["email"])
+        rows = [self.resolve_expiry(row) for row in self.repo.bookings_for(who["email"])]
+        used = len([row for row in rows
                     if parse(row["start_time"]).date() == today and row["state"] != "cancelled"])
         return 200, {
-            "bookings": [self.booking_view(row) for row in self.repo.bookings_for(who["email"])],
+            "bookings": [self.booking_view(row) for row in rows],
             "limit": {
                 "max_per_day": self.config["bookings_per_day"],
                 "used": used,
@@ -675,7 +693,7 @@ class Application:
         machine = self.repo.machine(code)
         if machine is None:
             return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
-        return 200, [self.public_booking_view(row, machine["code"])
+        return 200, [self.public_booking_view(self.resolve_expiry(row), machine["code"])
                       for row in self.repo.bookings_on_machine(machine["id"])]
 
     def public_booking_view(self, booking, machine_code=None) -> dict:
@@ -701,12 +719,13 @@ class Application:
         status, denial = self.booking_entitlement(self.customer(headers), booking)
         if status != entitlements.ALLOWED:
             return status, denial
+        # R3, decision 2: the state a read answers with is the state the rule says it is, evaluated at the
+        # moment of the read — but only for a caller who is entitled, because a refusal writes nothing.
+        booking = self.resolve_expiry(booking)
         self.trace(booking)
         view = self.booking_view(booking)
-        # The same shape the booking creation answers with: the booking is the payload and `booking` is the
-        # same object under its key, so the read can be taken either way — as the record (`moved["machine"]`,
-        # the way the R10 test reads the reassignment) or as the envelope (`json()["booking"]`, the way the
-        # entitlement tests read it). One shape, so the two reads of the same record cannot drift.
+        # The booking is the payload, the same shape the creation response answers with: readable straight
+        # off the body or under its key, so the same record is never spelled two ways by the seam.
         return 200, {**view, "booking": view}
 
     def handle_cancel(self, body, headers, path=None):
@@ -714,8 +733,9 @@ class Application:
 
         The refusal is at the seam, not in what the front-end shows: a caller who already holds the
         id is refused even on a booking a UI would render as clickable. Nothing is written for a
-        caller who is not entitled. The cancellation window (R4) is issue #15 — this slice carries the
-        entitlement, and here only the state that is already committed to a machine is refused.
+        caller who is not entitled. The window (R4, `src/cancellation.py`) is read after that gate, not
+        before it: a refusal of the entitlement is the answer to a caller who has no standing on the
+        booking at all, and the two statuses must stay distinguishable (issue #12).
         """
         booking = self.repo.booking_by_id(self.booking_id_of(path))
         who = self.customer(headers)
@@ -728,26 +748,40 @@ class Application:
         """The cancellation core, once: the same write behind the customer's cancel and the panel's.
 
         The entitlement is decided by the caller's gate before this runs, so the only thing left here is
-        the state test (R4 is issue #15) and the write itself. Splitting it out is what keeps the two
-        paths from answering differently for the same booking.
+        R4 — the window, read through `src/cancellation.py` — then the state test, then the write. The
+        window is read before the state test because it is the rule that refuses a late request, and both
+        refusals show the state as it already is: a refusal is a decision, not a write, so the booking
+        keeps its state and the machine keeps the state the booking holds it in (US46).
+
+        Splitting it out is what keeps the two paths from answering differently for the same booking.
         """
         now = self.clock.now()
-        if booking["state"] != "confirmed":
-            # US46: the state of a booking that can no longer be cancelled is shown. The window that
-            # decides it (R4) is issue #15; here the machine is already committed, so the state is the
-            # whole of the answer.
-            return 409, {"error": "not_cancellable", "state": booking["state"],
-                          "message": f"La prenotazione non è cancellabile: stato {booking['state']}"}
+        start = parse(booking["start_time"])
         self.trace(booking)
         machine = self.repo.machine_by_id(booking["machine_id"])
+        if not cancellation.may_cancel(start, now, self.config):
+            # The customer is blocked from an action she can still ask for: that is the event the one
+            # metric of the instrumented journey counts. It counts the refusal, not the booking: a turn
+            # given back before the cutoff is not a turn lost (AC7, R9).
+            self.telemetry.count("customer_blocked_total", journey=self.journey)
+            return 409, cancellation.refusal(booking, machine, self.config, now, start,
+                                             cancellation.WINDOW_REFUSED)
+        if booking["state"] not in cancellation.CANCELLABLE_STATES:
+            # US46: the state of a booking that can no longer be cancelled is shown. The window has already
+            # been read; here the machine is committed to a turn, so the state is the whole of the answer.
+            return 409, cancellation.refusal(booking, machine, self.config, now, start, cancellation.STATE_REFUSED)
         self.repo.set_booking_state(booking["id"], "cancelled")
         if machine is not None and machine["state"] == "reserved":
-            # US45: the slot becomes bookable by others at once.
+            # US45: the slot becomes bookable by others at once. No buffer is charged for a cancellation —
+            # the buffer is the hop that follows a cycle actually run (R10), and this is the declared hop
+            # `reserved -> available`, taken at the moment of the request.
             self.transition(machine["id"], "available", now)
+        # R9, AC7: nothing here touches the no-show counter. The incident is the cancellation itself.
         self.repo.record_incident("cancellation", now, "cancelled at the seam", booking["email"],
                                   booking["machine_id"], booking["id"])
         # The answer is the booking as the row is now, not as it was when the request arrived.
         return 200, {"outcome": "cancelled", "booking": self.booking_view(self.repo.booking_by_id(booking["id"])),
+                      "cutoff_minutes": cancellation.cutoff_minutes(self.config),
                       "message": "Prenotazione cancellata: lo slot torna disponibile"}
 
     def booking_view(self, booking, machine_code=None):
@@ -780,50 +814,116 @@ class Application:
         }
 
     def parse_start(self, value):
+        """The start the request names, read the way the clock reads an instant: one reading, no drift."""
         if not value:
             return None
         try:
-            if len(value) == 5:
-                time = datetime.strptime(value, "%H:%M").time()
-                return datetime.combine(self.clock.now().date(), time)
-            return datetime.fromisoformat(value)
-        except ValueError:
+            return self.clock.resolve(value)
+        except (ValueError, TypeError):
             return None
 
     # --- lock API (the device boundary, behind the seam) -------------------
+    # The grace window and the single use of a code (issue #14, R3) sit on this side of the seam: the
+    # machine controller is the caller, so every outcome here is what the keypad shows on the machine.
+
+    def expire(self, booking, window, now) -> dict | None:
+        """The three facts a lost turn leaves behind: booking `expired`, machine `available`, code dead.
+
+        The machine hop goes through the R6 table and only from the states an un-honoured turn leaves a
+        machine in: `reserved`, or `unlocked` when the customer opened it and never started a cycle. A
+        machine already out of circulation is not released by somebody else's lost turn. The no-show is
+        recorded because the turn was lost — that is what R9 counts — and the incident is the record the
+        owner panel reads (US57). The state guard makes it one fact: the same lost turn read twice is not
+        written twice.
+        """
+        machine = self.repo.machine_by_id(booking["machine_id"])
+        if machine is not None and machine["state"] in ("reserved", "unlocked"):
+            self.transition(machine["id"], "available", now, event="grace_window_closed")
+        self.repo.set_booking_state(booking["id"], "expired")
+        self.repo.record_no_show(booking["email"], now, booking["id"])
+        self.repo.record_incident("no_show", now, "code not redeemed within the grace window",
+                                  booking["email"], booking["machine_id"], booking["id"])
+        return self.repo.booking_by_id(booking["id"])
+
+    def lost_turn(self, window) -> str:
+        """US25: the customer lost the turn, and the machine is not broken. The copy has to say exactly that."""
+        return (f"Hai perso il turno: il codice non funziona più, la finestra di tolleranza era "
+                f"{hhmm(window[0])}–{hhmm(window[1])}. La macchina non è guasta: è tornata disponibile.")
+
+    def expired_answer(self, booking, window, now) -> dict:
+        """The outcome R3 names, answered on the record as it is after the fact is written."""
+        row = self.expire(booking, window, now) or booking
+        return {"outcome": "expired", "state": row["state"],
+                "grace_window": {"from": hhmm(window[0]), "to": hhmm(window[1])},
+                "message": self.lost_turn(window),
+                "incident": "no_show"}
+
+    def resolve_expiry(self, booking) -> dict | None:
+        """R3 evaluated at the moment of the read (issue #14, decision 2).
+
+        No background scheduler: expiry is evaluated at redemption and on any read of the booking. That is
+        what keeps the rule an externally observable outcome — the same three facts whoever notices them —
+        and what keeps it testable without a job no test could wait for.
+        """
+        if booking is None or booking["state"] != "confirmed":
+            return booking
+        now = self.clock.now()
+        window = rules.grace_window(parse(booking["start_time"]), self.config)
+        if now <= window[1]:
+            return booking  # the window has not closed: the turn is still the customer's, or has not begun
+        return self.expire(booking, window, now)
 
     def handle_redeem(self, body, headers, path=None):
+        """R3 at the machine keypad: numeric code, one booking, one use, inside the window.
+
+        The window is inclusive on both bounds (`rules.in_window`), because R3 states both bounds and an
+        attempt on either bound is inside. The four outcomes are the vocabulary the device boundary fixes:
+        `unlocked`, `expired`, `already_redeemed`, `unknown_code`, and the two refusals read as the
+        customer's own situation rather than as a system failure: a typo is `unknown_code` (US27), a lost
+        turn is `expired` with the copy that says the turn is gone, not that the machine is broken (US25).
+
+        Nothing here delivers the code: it lives only inside the booking (US21, US22), there is no email or
+        SMS transport to send it, and it never enters a log line. Nothing here starts a cycle either:
+        `running` is the outcome of the controller's `cycle_started` report, never of a redemption, never of
+        a timer and never of an assumption that tokens were inserted (AC8).
+        """
         code = body.get("code")
         booking = self.repo.booking_by_code(code) if code else None
         if booking is None:
-            return 404, {"outcome": "unknown_code", "message": "Codice sconosciuto"}
+            # US27: the answer names what happened to the string the keypad sent — it belongs to no booking.
+            # `identity.NEVER_ISSUED` is the shape a mistyped entry reads as and it is never generated, so a
+            # typo can never land on somebody else's booking and can never read as a real one.
+            return 404, {"outcome": "unknown_code", "digits": credentials.CODE_LENGTH,
+                          "message": "Codice sconosciuto: controlla le cifre del codice mostrato nella tua prenotazione. La macchina non ha alcun problema."}
         now = self.clock.now()
-        start = parse(booking["start_time"])
-        grace_from, grace_to = rules.grace_window(start, self.config)
+        window = rules.grace_window(parse(booking["start_time"]), self.config)
         machine = self.repo.machine_by_id(booking["machine_id"])
         self.trace(booking)
 
-        if booking["state"] == "confirmed" and now < grace_from:
-            # R3: the code does not work before the window, so this attempt is refused and the code is
-            # not consumed (US26: a code is usable only once). What the controller reports is still a
-            # fact — the machine opened — so the declared hop `reserved -> unlocked` is recorded, and
-            # the open time is the moment `idle_open` is measured from (AC 5).
-            if machine["state"] == "reserved":
-                self.transition(machine["id"], "unlocked", now, event="redeem")
-            self.repo.record_open(booking["id"], now)
-            return 403, {"outcome": "not_your_time", "message": "Il codice funziona dall'orario di inizio, non prima",
-                          "valid_from": hhmm(grace_from)}
-        if booking["state"] == "confirmed" and now > grace_to:
-            self.transition(booking["machine_id"], "available", now, event="redeem")
-            self.repo.set_booking_state(booking["id"], "expired")
-            self.repo.record_no_show(booking["email"], now, booking["id"])
-            incident = self.repo.record_incident("no_show", now, "code not redeemed within the grace window",
-                                                 booking["email"], booking["machine_id"], booking["id"])
-            return 409, {"outcome": "expired", "message": "Il codice non funziona più: la finestra di tolleranza è finita",
-                         "grace_window": {"from": hhmm(grace_from), "to": hhmm(grace_to)},
-                         "incident": incident["kind"]}
-        if booking["state"] == "unlocked":
-            return 409, {"outcome": "already_redeemed", "message": "Il codice è già stato usato"}
+        if booking["state"] == "confirmed" and not rules.in_window(now, window, self.config):
+            if now < window[0]:
+                # R3: the code does not work before the window, so this attempt is refused and the code is
+                # not consumed (US26: a code is usable only once). What the controller reports is still a
+                # fact — the machine opened — so the declared hop `reserved -> unlocked` is recorded, and
+                # the open time is the moment `idle_open` is measured from (AC 5).
+                if machine["state"] == "reserved":
+                    self.transition(machine["id"], "unlocked", now, event="redeem")
+                self.repo.record_open(booking["id"], now)
+                return 403, {"outcome": "not_your_time",
+                              "message": f"Il codice funziona da {self.config['grace_minutes']} minuti prima dell'orario di inizio, non prima",
+                              "valid_from": hhmm(window[0]),
+                              "grace_window": {"from": hhmm(window[0]), "to": hhmm(window[1])}}
+            # AC3, past the window: the turn is lost, and the answer is the three facts R3 leaves behind.
+            return 409, self.expired_answer(booking, window, now)
+        if booking["state"] in SPENT_STATES:
+            # US26: one code, one use — whatever the machine has done in the meantime.
+            return 409, {"outcome": "already_redeemed", "state": booking["state"],
+                          "message": "Il codice è già stato usato: ogni codice funziona una volta sola"}
+        if booking["state"] in machine_states.BOOKING_TERMINAL_STATES:
+            # AC3: the code is dead, and a dead code stays dead. The answer is the same lost turn read
+            # again, and it writes nothing, because there is no turn left to honour.
+            return 409, {"outcome": "expired", "state": booking["state"],
+                          "message": "Il codice non funziona più: il turno non esiste più"}
 
         # The hop `reserved -> unlocked` is what the device fact records; if the machine was already
         # recorded as open by an out-of-window attempt there is nothing to move, the state stands.
@@ -831,7 +931,8 @@ class Application:
             self.transition(machine["id"], "unlocked", now, event="redeem")
         self.repo.set_booking_state(booking["id"], "unlocked")
         self.repo.record_open(booking["id"], now)
-        return 200, {"outcome": "unlocked", "machine": machine["code"], "tokens_required": booking["tokens"]}
+        return 200, {"outcome": "unlocked", "machine": machine["code"], "tokens_required": booking["tokens"],
+                      "grace_window": {"from": hhmm(window[0]), "to": hhmm(window[1])}}
 
     def handle_report(self, body, headers, path=None):
         event = body.get("event")

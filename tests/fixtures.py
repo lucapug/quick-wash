@@ -85,6 +85,15 @@ def exposed_fixtures() -> list[str]:
     return sorted(name for name in dir(module) if is_fixture(getattr(module, name)))
 
 
+# The contradiction the file issue #14 (R3) carries: the rule is right, the access is not. Recorded as one
+# reason so the three entries below read as one fact.
+R03_NO_SESSION = (
+    "issue #14: the supplied file books and reads a booking with no session, while AC7 of issue #9 pins an "
+    "anonymous booking request at 401 and AC2 of issue #10 pins the read of a booking to the customer it "
+    "belongs to; the rule itself is asserted as outcomes in "
+    "tests/integration/test_r03_grace_and_redemption_coverage.py"
+)
+
 # A test supplied in an issue arrives byte-identical and the executor may not adjust it
 # (docs/agent-team-spec.md). The file issue #48 supplies asserts an outcome this repository cannot produce:
 # the assignment is per machine, never per slot (R5), so the second request for the same type and slot books
@@ -107,6 +116,18 @@ KNOWN_CONTRADICTIONS = {
         "tests/integration/test_r10_turnover_and_cleaning_coverage.py (the machine inside the 10-minute buffer "
         "is not counted free and the point the buffer covers carries `turnover_buffer`). If a human decides "
         "the window may name a machine, this entry has to be removed and issue #8's AC2 re-opened.",
+
+    # Issue #14 (R3): the file the issue supplies is executable in every other respect — the window is
+    # inclusive on both bounds, a code is usable once, an unknown code answers `unknown_code`, a lost turn
+    # expires the booking and releases the machine, and each of those is asserted as an HTTP outcome in
+    # tests/integration/test_r03_grace_and_redemption_coverage.py. What it cannot do is reach them: it
+    # books and reads a booking with no session, while AC7 of issue #9 pins an anonymous booking request at
+    # 401 (docs/spec.md excludes anonymous booking because it makes no-shows untraceable and R9 impossible)
+    # and AC2 of issue #10 pins the read of a booking to the customer it belongs to. The two issues cannot
+    # both be satisfied from inside the supplied file, so the entry stands until a human corrects one side.
+    ("test_r03_grace_and_redemption.py", "test_code_works_from_10_minutes_before_start"): R03_NO_SESSION,
+    ("test_r03_grace_and_redemption.py", "test_redemption_after_the_grace_window_expires_the_booking"): R03_NO_SESSION,
+    ("test_r03_grace_and_redemption.py", "test_single_use_and_unknown_code"): R03_NO_SESSION,
 }
 
 
