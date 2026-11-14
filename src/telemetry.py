@@ -14,8 +14,8 @@ being a promise:
    credential arrives in a body, so a body is never an input here, and the logged path is the path
    without its query.
 2. `guard` is the assertion on what is recorded: no field named like a credential, and no recorded
-   value shaped like one — four digits or more is the shape of both codes (the one-time code is 6, the
-   unlock code is 4, `src/identity.py`), an `@` is the shape of an email. It refuses rather than
+   value shaped like one — four digits or more is the shape of both codes (both are 6 digits,
+   `src/identity.py`), an `@` is the shape of an email. It refuses rather than
    redacts: a redacted credential is still a credential that got into a log line, so nothing is stored
    and nothing is printed when it fires.
 
@@ -33,7 +33,7 @@ from src.clock import Clock
 # The field names that are credentials. They are never arguments of `record`.
 CREDENTIAL_KEYS = ("email", "otp", "code", "password", "token", "secret", "pin")
 
-# The shapes: the numeric code (4 digits is the unlock code, 6 is the one-time code) and the email.
+# The shapes: the numeric code (both codes are 6 digits, `src/identity.py`) and the email.
 CODE_SHAPE = re.compile(r"\d{4,}")
 EMAIL_SHAPE = re.compile(r"@")
 
