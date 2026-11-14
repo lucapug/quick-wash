@@ -102,6 +102,12 @@ R03_NO_SESSION = (
 # tests/integration/test_refusal_alternatives_ux_coverage.py. The contradiction is recorded here as an xfail
 # so the gate runs green while it stays visible in the report: the supplied file is not changed and nothing
 # in src/ is bent to make it pass. When a human corrects one side of it, the entry below has to be removed.
+#
+# The same applies to the file issue #18 (R9) supplies: its first request is the slot of the current moment,
+# which issue #45 AC3 refuses as already begun, so the no-show it then describes cannot be created. The R9
+# facts are read back as outcomes in tests/integration/test_r09_no_show_block_coverage.py, where the first
+# no-show is created on a slot the shop can still take. What the two supplied files cannot both assert is
+# recorded below, and neither side is adjusted for it.
 KNOWN_CONTRADICTIONS = {
     ("test_refusal_alternatives_ux.py", "test_409_lists_valid_alternatives_earliest_first_same_type"):
         "issue #48: R5 assigns per machine, so a second sequential request for the same type and slot is "
@@ -118,6 +124,25 @@ KNOWN_CONTRADICTIONS = {
     ("test_r03_grace_and_redemption.py", "test_code_works_from_10_minutes_before_start"): R03_NO_SESSION,
     ("test_r03_grace_and_redemption.py", "test_redemption_after_the_grace_window_expires_the_booking"): R03_NO_SESSION,
     ("test_r03_grace_and_redemption.py", "test_single_use_and_unknown_code"): R03_NO_SESSION,
+
+    # Issue #18 (R9): the file the issue supplies asserts the right outcomes — the counter, the block with
+    # its reason and its expiry on the customer's own view before any booking attempt, the 403, the booking
+    # that succeeds on the expiry date — and the seam answers each of them as written, read back in the
+    # coverage file. What it cannot do is create the first fact from inside itself: its first request is the
+    # slot of the moment the request arrives, which issue #45 AC3 refuses as already begun (422, pinned by
+    # tests/integration/test_booking_creation_happy_path.py), and its `advance(minutes=11)` closes a grace
+    # window only for a slot that has already begun, so the counter it then reads cannot be fed. The two
+    # files are both pinned, so the entry stands until a human corrects one side.
+    ("test_r09_no_show_block.py", "test_block_is_enforced_and_shown_with_reason_and_expiry"):
+        "issue #18: the supplied test books 09:00 with the clock at 09:00, the slot that has already begun "
+        "(issue #45, AC3), so the 422 tests/integration/test_booking_creation_happy_path.py pins for that "
+        "request is what answers and no booking exists to be no-showed; its advance(minutes=11) closes a "
+        "grace window only for a slot that has already begun, so the counter it reads cannot be fed from "
+        "inside the file. Every assertion it names is answered as supplied on a slot the shop can still "
+        "take — the counter, the block with its reason and its expiry on the customer's own view, the 403, "
+        "the booking that succeeds on the expiry date — read back in "
+        "tests/integration/test_r09_no_show_block_coverage.py. Both files are pinned, so the contradiction "
+        "needs a human on which side moves.",
 }
 
 

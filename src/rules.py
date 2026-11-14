@@ -7,12 +7,16 @@ seam instead. No I/O here, no database, no clock object: inputs and outputs are 
 
 The first of the three lives in src/domain/time.py, where the grid, the refusal vocabulary and the
 next valid alternatives are defined (issue R1+R2). This module delegates to it so the grid has one
-source: the unit test for the helper and the booking handler read the same function.
+source: the unit test for the helper and the booking handler read the same function. The third lives in
+src/domain/counters.py, which owns the rolling window and the instant-level block expiry the issue
+records; `no_show_block` below is the day-level adapter the unit test of issue #18 pins and it delegates
+the window to that module, so the two cannot disagree about which facts are inside the window.
 """
 
 from datetime import date, datetime, timedelta
 
 from src.config import SEED
+from src.domain import counters
 from src.domain import time as start_times
 
 # R5, the loser's answer (the decision #47 preserves): the persistence refusal carries a bounded set of
@@ -54,9 +58,17 @@ def no_show_block(no_shows: list[date], today: date, config: dict = SEED) -> dat
 
     `no_shows` are the dates the customer failed to honour a turn (`idle_open` counts as a
     no-show). Two inside the rolling window block new bookings for `block_days`.
+
+    This is the day-level adapter tests/test_rules.py pins: the expiry counted from the day the counter is
+    read. The seam reads `src/domain/counters.py`, which owns the instant-level reading the issue records
+    (the block runs from the moment of the crossing and expires at the same local time). The two agree
+    whenever the counter is read at the moment of the crossing — which is what happens at the seam, since
+    the crossing is written by the request that reads it — and diverge when the crossing is in the past.
+    The divergence is recorded here rather than resolved: a pinned test cannot be adjusted, and the same
+    rule cannot be written twice. The rolling window itself has one source — `counters.window` — so the
+    adapter and the counter cannot disagree about which facts are inside it.
     """
-    window = timedelta(days=config["no_show_window_days"])
-    inside = [day for day in no_shows if today - day <= window]
+    inside = counters.window(no_shows, today, config)
     if len(inside) < config["no_show_threshold"]:
         return None
-    return today + timedelta(days=config["block_days"])
+    return counters.instant(today).date() + timedelta(days=config["block_days"])
