@@ -29,6 +29,12 @@ caller is no longer a customer that can book — it is the reviewer's observer, 
 The telemetry read is the reviewer's view of the request lines; the recorder itself (`src/telemetry.py`)
 is what keeps a credential out of them (AC3).
 
+The customer's own view (issue #18, R9) is the fourth pattern: `GET /api/customers/me` answers the counter,
+the block and its expiry before any booking attempt (US51), and it is the same `block_view` the 403 on
+`POST /api/bookings` answers with — one decision in `src/domain/counters.py`, so the view and the refusal
+cannot disagree about what the customer is blocked for or until when. It needs a session, because a caller
+with no identity has no counter to read.
+
 The unlock code and its grace window (issue #14, R3): the code is the booking's own numeric code, six
 digits as the machine keypad reads it, tied to one row and redeemed once on `POST /api/lock/redeem` inside
 `[start - 10, start + 10]`, inclusive on both bounds. The four outcomes of that path are fixed:
@@ -94,6 +100,7 @@ from datetime import datetime, timedelta
 from src import alternatives, availability, cancellation, domain, entitlements, faults, machine_states, rules
 from src import identity as credentials
 from src.clock import Clock
+from src.domain import counters
 from src.domain import time as start_times
 from src.config import SEED
 from src.repository import Repository, parse
@@ -133,7 +140,12 @@ SPENT_STATES = ("unlocked", "running", "finished")
 # tests/test_seam.py pins: the state of one machine (issue #6, AC8), the verification of a one-time
 # code, and the telemetry read. The contract fixes the sign-in request; the code it showed in-app is
 # redeemed on its sub-path, and the log lines are read on theirs.
-PATTERNS = {"POST /api/session/verify": "verify", "GET /api/logs/recent": "logs"}
+# The customer's own view (issue #18, R9) is the fourth pattern, for the same reason: US51 asks the block
+# and its expiry to be visible before any booking attempt, so the read exists on its own sub-path and
+# `ROUTES` stays the eight entries tests/test_seam.py pins. It needs a session, because a caller with no
+# identity has no counter to read.
+PATTERNS = {"POST /api/session/verify": "verify", "GET /api/logs/recent": "logs",
+           "GET /api/customers/me": "customer_me"}
 
 # The booking surface of one booking (issue #10, slice a): the read of a booking and its cancellation.
 # Patterns, not contract paths, so `ROUTES` stays exactly the eight entries tests/test_seam.py pins —
@@ -224,7 +236,8 @@ class Application:
             return status, payload
 
     def pattern_route(self, method: str, path: str) -> str | None:
-        """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs.
+        """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs,
+        and the customer's own view (issue #18, R9).
 
         The report surface of one machine is a pattern too: `POST /api/lock/reports` is the contract entry
         for a report, and the machine it is about is the same decision addressed to the machine. So is the
@@ -517,15 +530,18 @@ class Application:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice per prenotare"}
         now = self.clock.now()
 
-        blocked = rules.no_show_block(self.repo.no_shows(who["email"]), now.date(), self.config)
-        if blocked:
+        # R9, read through the pure counter (`src/domain/counters.py`): the rolling window, the crossing,
+        # the expiry at the same local time. AC4 is what the answer carries — the reason, the count that
+        # caused it, the expiry — and the shape is `block_view`, the same one the customer's own view
+        # answers with (AC5), so the refusal and the view cannot disagree about what the customer is
+        # blocked for or until when. The copy is Italian; the keys stay English. `error: blocked` and the
+        # top-level `until`/`no_shows` stay because tests/test_journey.py pins them on the refusal.
+        block = counters.block_view(self.repo.no_shows(who["email"]), now, self.config)
+        if block["blocked"]:
             self.telemetry.count("customer_blocked_total", journey=self.journey)
-            return 403, {
-                "error": "blocked",
-                "until": blocked.isoformat(),
-                "no_shows": len(self.repo.no_shows(who["email"])),
-                "message": f"Prenotazioni bloccate fino al {blocked.isoformat()} per mancate presentenze",
-            }
+            return 403, {"error": "blocked", "block": block,
+                          "until": block["until"], "no_shows": block["no_shows"],
+                          "message": block["message"]}
 
         type_key = body.get("type")
         if type_key not in self.config["tariffs"]:
@@ -575,8 +591,7 @@ class Application:
                 "message": "Lo slot scelto non può essere rispettato",
             }
 
-        used = len([row for row in self.repo.bookings_for(who["email"])
-                    if parse(row["start_time"]).date() == start.date() and row["state"] != "cancelled"])
+        used = self.daily_limit(who, start.date())["used"]
         limit = self.config["bookings_per_day"]
         if used >= limit:
             return 409, {
@@ -645,18 +660,53 @@ class Application:
         now = self.clock.now()
         today = now.date()
         rows = [self.resolve_expiry(row) for row in self.repo.bookings_for(who["email"])]
-        used = len([row for row in rows
-                    if parse(row["start_time"]).date() == today and row["state"] != "cancelled"])
         return 200, {
             "bookings": [self.booking_view(row) for row in rows],
-            "limit": {
-                "max_per_day": self.config["bookings_per_day"],
-                "used": used,
-                "remaining": self.config["bookings_per_day"] - used,
-                "resets_at": f"{today.isoformat()} 23:59",
-            },
-            "block": {"blocked": rules.no_show_block(self.repo.no_shows(who["email"]), today, self.config)},
+            "limit": self.daily_limit(who, today),
+            "block": counters.block_view(self.repo.no_shows(who["email"]), now, self.config),
         }
+
+    def handle_customer_me(self, body, headers, path=None):
+        """AC5: the customer's own view, read before any booking attempt.
+
+        US51 is the reason this read exists: a customer who is refused without being told why, and until
+        when, cannot correct the behaviour, so the counter, the block and its expiry are on the customer's
+        view before the booking is attempted — in Italian, and in the same `block_view` the 403 answers
+        with, not a second copy of the rule.
+
+        It is the customer's view, so it needs a session: the observer of issue #6, AC8 has no counter to
+        read because it has no identity to hold a no-show against (R9 needs a name), and the gate is the
+        same one the booking surface uses — 401 for a missing session. The view answers to the identity the
+        token resolves to, and to no other caller.
+        """
+        who = self.customer(headers)
+        if who is None:
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        now = self.clock.now()
+        occurrences = self.repo.no_shows(who["email"])
+        block = counters.block_view(occurrences, now, self.config)
+        return 200, {
+            "email": who["email"],
+            "is_owner": bool(who["is_owner"]),
+            "no_show_count": len(occurrences),
+            "no_shows_in_window": block["no_shows"],
+            "block": block,
+            "bookings": [self.booking_view(row) for row in self.repo.bookings_for(who["email"])],
+            "limit": self.daily_limit(who, now.date()),
+            "message": block["message"],
+        }
+
+    def daily_limit(self, who, day) -> dict:
+        """R11 as the customer reads it (US48): the limit, what is used, what is left, when it resets.
+
+        In one place, so the customer's list and the customer's view cannot disagree about the same day.
+        Cancelled bookings do not count, which is what makes US45 true on the read as well as on the write.
+        """
+        used = len([row for row in self.repo.bookings_for(who["email"])
+                    if parse(row["start_time"]).date() == day and row["state"] != "cancelled"])
+        limit = self.config["bookings_per_day"]
+        return {"max_per_day": limit, "used": used, "remaining": limit - used,
+                "resets_at": f"{day.isoformat()} 23:59"}
 
     def machine_bookings(self, code) -> tuple[int, dict | list]:
         """The machine-scoped read: the bookings attached to the machine the request names.

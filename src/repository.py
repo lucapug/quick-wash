@@ -260,8 +260,14 @@ class Repository:
                         (email, iso(now), booking_id))
 
     def no_shows(self, email: str) -> list:
-        return [parse(row["occurred_at"]).date() for row in
-                self.db.rows("SELECT occurred_at FROM no_shows WHERE email = ?", (email,))]
+        """The customer's no-shows as the moments they happened, oldest first.
+
+        The counter is read on instants, not on calendar days: the block expires at the same local time,
+        seven days after the crossing (`src/domain/counters.py`), so the row keeps its time and is not
+        flattened to a date here. A pure helper receives data, so this is the data the seam hands it.
+        """
+        return [parse(row["occurred_at"]) for row in
+                self.db.rows("SELECT occurred_at FROM no_shows WHERE email = ? ORDER BY occurred_at", (email,))]
 
     def record_incident(self, kind: str, now: datetime, detail: str, email: str = None,
                         machine_id: int = None, booking_id: int = None) -> dict:

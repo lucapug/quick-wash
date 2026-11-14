@@ -38,8 +38,15 @@ class Clock:
         self._now = self.resolve(instant)
         return self._now
 
-    def advance(self, minutes: int) -> datetime:
-        self._now = self._now + timedelta(minutes=minutes)
+    def advance(self, minutes: int = 0, days: int = 0) -> datetime:
+        """The clock moved by a distance, not by one unit.
+
+        `days` joined the signature because R9 is measured in days (the rolling 30-day window and the
+        7-day block) while R3 and R10 are measured in minutes, and one clock has to answer both without a
+        rule test reaching for a different method. Both are named with a default, so `advance(30)` is
+        still the same call as it was.
+        """
+        self._now = self._now + timedelta(days=days, minutes=minutes)
         return self._now
 
     def day(self):
