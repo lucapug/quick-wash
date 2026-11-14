@@ -32,7 +32,11 @@ entitlement, 401 for a missing session.
 
 No I/O here: `who` is the identity the session resolves to, `booking` is the row or None,
 `had_booking` is the fact that the caller had a turn on that machine (the rows, or their truthiness).
+The R10 report reads the same rows for the assignment half: `current_booking` is the live record the
+claim is read against, and `machine_states` is read for the declared cleaning state only.
 """
+
+from src import machine_states
 
 # The two refusals, as the decision names them.
 MISSING_SESSION = 401
@@ -75,6 +79,41 @@ def may_report(who: dict | None, had_booking) -> bool:
     if who is None:
         return False
     return bool(had_booking)
+
+
+# The states a booking can be live in: the assignment the machine is held in, so the customer it names
+# is the one standing in front of it.
+ASSIGNED_BOOKING_STATES = ("confirmed", "unlocked", "running")
+
+
+def current_booking(who: dict | None, bookings) -> dict | None:
+    """The record the still-occupied report is read against: the caller's live booking on that machine.
+
+    The assignment is fixed at booking time (spec, Reconciliation), so the customer who can say the
+    machine is still full of somebody else's laundry is the one the machine is held for now — the same
+    record the reassignment or the refund is decided on.
+    """
+    if who is None:
+        return None
+    return next((row for row in bookings
+                 if row["email"] == who["email"] and row["state"] in ASSIGNED_BOOKING_STATES), None)
+
+
+def may_report_still_occupied(who: dict | None, bookings, machine_state: str, reported_by: bool = False) -> bool:
+    """R10's entitlement, in one line: the customer currently assigned to the machine.
+
+    The machine is held for one live booking at a time, so the claim is that customer's. The repeat
+    (US35) is what the second half of the predicate is for: the customer whose report admitted the
+    first claim keeps the entitlement R7 gives — the report is about what happened on the machine they
+    had a turn on — while the window that report opened is still running. When the window has closed the
+    claim is the current assignment's again, and the customer the reassignment moved is no longer the one
+    who can make it.
+    """
+    if who is None:
+        return False
+    if current_booking(who, bookings) is not None:
+        return True
+    return machine_state == machine_states.REPEAT_REPORT["state"] and bool(reported_by)
 
 
 def missing_session() -> dict:

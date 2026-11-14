@@ -112,6 +112,16 @@ KNOWN_CONTRADICTIONS = {
     ("test_refusal_alternatives_ux.py", "test_409_lists_valid_alternatives_earliest_first_same_type"):
         "issue #48: R5 assigns per machine, so a second sequential request for the same type and slot is "
         "not a loser (201); and the seed its comment writes needs 3 machines of the type, conftest pins 2",
+    ("test_r10_turnover_and_cleaning.py", "test_turnover_buffer_of_10_minutes_blocks_the_machine"):
+        "issue #10 (R10): the supplied test reads a `machine` key on the availability slots, but the public "
+        "availability view is answered per machine type and never names a physical machine, a customer or a "
+        "code (issue #8, AC2 and AC6, pinned byte-identical by "
+        "tests/integration/test_availability_reasons.py::test_the_window_is_public_and_never_names_a_machine_a_customer_or_a_code). "
+        "Two supplied tests contradict each other on the shape of the public view, so the contradiction is "
+        "recorded rather than resolved by bending src/: the same criterion is read back as an outcome in "
+        "tests/integration/test_r10_turnover_and_cleaning_coverage.py (the machine inside the 10-minute buffer "
+        "is not counted free and the point the buffer covers carries `turnover_buffer`). If a human decides "
+        "the window may name a machine, this entry has to be removed and issue #8's AC2 re-opened.",
 
     # Issue #14 (R3): the file the issue supplies is executable in every other respect — the window is
     # inclusive on both bounds, a code is usable once, an unknown code answers `unknown_code`, a lost turn
