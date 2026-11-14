@@ -19,9 +19,11 @@ a trace or an error message. `src/telemetry.py` is the guard on the recording si
 name the reason without echoing the code.
 
 Two codes, never the same thing (AC6): the one-time code is the sign-in credential, the unlock code is
-the booking's own numeric code, tied to one booking and displayed only inside that booking. They are
-different shapes on purpose — 6 digits against 4 — so a test can tell them apart and so they can never
-collide.
+the booking's own numeric code, tied to one booking and displayed only inside that booking. Both are
+numeric and both are six digits — the machine keypad is numeric, so the unlock code has to be (issue #14,
+AC1) — and what keeps them apart is not their shape but what they are: one is a credential that is
+hashed for storage and never leaves the sign-in response, the other is a fact of a booking row that is
+never sent anywhere and never shown outside that booking.
 
 No password (AC1): the sign-in handler reads the email and nothing else, the identities table has no
 password column, and there is no reset flow — a spent or an expired code is refused with 401 and the
@@ -38,9 +40,15 @@ from src.config import SEED
 SIGN_IN_FIELDS = ("email",)
 VERIFY_FIELDS = ("email", "otp")
 
-# The code is numeric because the keypad is numeric: the same shape the unlock code has, one digit
-# group longer so the two can never be confused (AC6).
+# The code is numeric because the keypad is numeric: the same shape the unlock code has, so the two are
+# told apart by what they are (see the module docstring), not by their length.
 OTP_LENGTH = 6
+
+# The unlock code, six digits (issue #14, AC1). `NEVER_ISSUED` is the shape a mistyped code reads as: it
+# is deliberately not generated, so a typo on the keypad stays `unknown_code` and can never be mistaken
+# for a booking that exists.
+CODE_LENGTH = 6
+NEVER_ISSUED = "000000"
 
 
 def unexpected(body: dict, fields: tuple) -> list[str]:

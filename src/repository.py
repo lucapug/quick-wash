@@ -158,6 +158,7 @@ class Repository:
         return self.db.one("SELECT * FROM bookings WHERE code = ?", (code,))
 
     def booking_by_code(self, code: str) -> dict | None:
+        """The booking one numeric code is tied to. The code is the only way a booking is read at the keypad."""
         return self.db.one("SELECT * FROM bookings WHERE code = ?", (code,))
 
     def booking_by_id(self, booking_id: int | None) -> dict | None:
@@ -256,9 +257,19 @@ class Repository:
         return self.db.rows("SELECT * FROM incidents ORDER BY id")
 
     def next_code(self, now: datetime) -> str:
+        """The booking's numeric code: six digits, one per booking, never the shape a typo reads as.
+
+        The code is tied to exactly one row: it is the key `booking_by_code` reads the booking back on at
+        the machine, and the UNIQUE index on `code` is what keeps one code on one booking. Generation is
+        deterministic so the seam can be exercised without a random draw, and `identity.NEVER_ISSUED` is
+        skipped: the shape a mistyped keypad entry reads as must stay a code that answers `unknown_code`,
+        never one that belongs to a customer.
+        """
         used = {row["code"] for row in self.db.rows("SELECT code FROM bookings")}
-        candidate = 1000 + len(used) + 1
-        while str(candidate) in used:
+        candidate = 100001
+        while True:
+            code = f"{candidate:0{identity.CODE_LENGTH}d}"
+            if code != identity.NEVER_ISSUED and code not in used:
+                return code
             candidate += 1
-        return str(candidate)
 
