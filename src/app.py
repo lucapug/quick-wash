@@ -77,6 +77,21 @@ handler runs: 401 for a caller with no session, 403 for a session that is not th
 enforcement at the seam, not a control the front-end hides — a customer who already holds the machine
 code or the booking id is refused on the panel path exactly as on the customer path, and a refusal
 writes nothing.
+
+R10 (turnover and cleaning, the numbers signed by addendum patch 2 — 10 and 30 minutes, held as
+configuration): the turnover buffer starts at the moment the device reports `cycle_finished`, because
+issue #15 established that only the device decides when a cycle ends, and the hop a `cycle_finished`
+report names from `unlocked` is therefore declared in `src/machine_states.py`. Both buffers are carried
+by time, not by a caller, so every request resolves the elapsed buffers before answering — that is what
+makes the state read a live read and the window answer `turnover_buffer` for a machine inside it. The
+still-occupied claim (`kind` `still_occupied`, the US33 spelling of the `occupied` kind; the published
+vocabulary stays the two kinds issue #10 pins) takes the machine to `cleaning_required` for its window and
+moves the claimant to a free machine of the same type at the same start time with a new code and the
+notification US38 asks for; when nothing of the type is free the booking is cancelled and the turn refunded
+so the customer can rebook at once (US39). A claim that arrives while the window is running is accepted and
+restarts it (US35) — the state stands, so no hop is attempted and the table declares no self-entry for
+`cleaning_required`. Its entitlement is narrower than R7's: the customer currently assigned to the machine
+(issue #12, AC6), the repeat being read against the record the first claim left on it.
 """
 
 from datetime import datetime, timedelta
@@ -130,6 +145,10 @@ BOOKING_CANCEL = ("POST", "/api/bookings/")
 # the machine a device reports on is not the caller's, the machine a person reports on is — R7.
 REPORT_SURFACE = ("POST", "/api/machines/")
 REPORT_KINDS = ("fault", "occupied")
+# The word US33 uses for the second kind: `still_occupied` is the customer's spelling of `occupied`, so the
+# claim arrives with it and is read as the same report. The published vocabulary stays the two canonical
+# kinds issue #10 (slice b) pins, so the answer to an unknown kind still lists exactly those two.
+REPORT_KIND_WORDS = {"still_occupied": "occupied"}
 
 # The owner panel (issue #10, slice c): the surfaces the panel owns, and the two things it can write.
 # Patterns, not contract paths, so `ROUTES` stays exactly the eight entries tests/test_seam.py pins.
@@ -683,7 +702,12 @@ class Application:
         if status != entitlements.ALLOWED:
             return status, denial
         self.trace(booking)
-        return 200, {"booking": self.booking_view(booking)}
+        view = self.booking_view(booking)
+        # The same shape the booking creation answers with: the booking is the payload and `booking` is the
+        # same object under its key, so the read can be taken either way — as the record (`moved["machine"]`,
+        # the way the R10 test reads the reassignment) or as the envelope (`json()["booking"]`, the way the
+        # entitlement tests read it). One shape, so the two reads of the same record cannot drift.
+        return 200, {**view, "booking": view}
 
     def handle_cancel(self, body, headers, path=None):
         """AC2 and AC3: the entitlement is decided before anything else is checked.
@@ -892,14 +916,12 @@ class Application:
         recorded.
         """
         who = self.customer(headers)
-        if who is None:
-            return entitlements.MISSING_SESSION, entitlements.missing_session()
         machine = self.repo.machine(body.get("machine", ""))
-        if machine is None:
-            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
-        # R7: only a customer who has or had a booking on that machine may report it.
-        if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
-            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
+        # R7: only a customer who has or had a booking on that machine may report it. The gate is the same
+        # decision the report surface runs, so the two paths cannot answer differently for one caller.
+        status, denial = self.report_gate(who, machine)
+        if status != entitlements.ALLOWED:
+            return status, denial
         return self.apply_fault(who, machine, now, faults.DEVICE)
 
     def handle_machine_report(self, body, headers, path=None):
@@ -918,26 +940,51 @@ class Application:
         is `src/faults.py`; R8 in full is the device boundary's work.
         """
         who = self.customer(headers)
-        if who is None:
-            return entitlements.MISSING_SESSION, entitlements.missing_session()
         machine = self.repo.machine(self.machine_code_of(path))
-        if machine is None:
-            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
-        if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
-            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
-        kind = body.get("kind") or body.get("event")
+        asked = body.get("kind") or body.get("event")
+        kind = REPORT_KIND_WORDS.get(asked, asked)
+        status, denial = self.report_gate(who, machine, kind=kind)
+        if status != entitlements.ALLOWED:
+            return status, denial
         if kind not in REPORT_KINDS:
             return 400, {"error": "unknown_kind", "message": "Segnalazione sconosciuta",
                           "accepted": list(REPORT_KINDS)}
+        # The gate is the same decision on both paths; the US33 spelling is read as the same report, and the
+        # claim is the current assignment's, so the kind decides how far the entitlement reaches.
         self.trace(self.repo.open_booking(machine["id"]))
         return self.apply_report(who, machine, kind, self.clock.now())
+
+    def report_gate(self, who, machine, held=None, kind: str | None = None) -> tuple[int, dict | None]:
+        """The report gate, in one place, for both paths the report can arrive on.
+
+        401 for a caller with no session, 404 for a machine the seam does not have, 403 for a caller who
+        never had a turn on it — decided before anything the report would write, so a refusal leaves the
+        machine in the state the table had for it and no incident is recorded. The still-occupied claim is
+        the one the gate reads narrower: the customer the machine is held for right now (issue #12, AC6).
+        `fault` keeps R7 as it is, so a past booking still entitles it.
+        """
+        if who is None:
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        if machine is None:
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
+        held = held if held is not None else self.repo.bookings_on_machine(machine["id"], who["email"])
+        if kind == "occupied":
+            # R10 narrows R7 here: the claim is the current assignment's, and the repeat (US35) is read
+            # against the record the first claim left on the machine, not against the booking the
+            # reassignment has already moved.
+            if not entitlements.may_report_still_occupied(
+                    who, held, machine["state"], bool(self.repo.reports_on_machine(machine["id"], who["email"]))):
+                return entitlements.NOT_ENTITLED, entitlements.report_refusal()
+        elif not entitlements.may_report(who, held):
+            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
+        return entitlements.ALLOWED, None
 
     def machine_code_of(self, path) -> str:
         """The machine the request names, read off the URL segment, report suffix stripped."""
         tail = (path or "").split("/api/machines/", 1)[1]
         return tail.removesuffix("/report")
 
-    def apply_report(self, who, machine, kind, now) -> tuple[int, dict]:
+    def apply_report(self, who, machine, kind, now, held=None) -> tuple[int, dict]:
         """A report that is taken: the kind decides which core runs, and both write through the R6 table.
 
         The two seam paths differ on the success status, and on one thing that is a fact about the record and
@@ -947,7 +994,7 @@ class Application:
         gate is the same decision on both paths.
         """
         status, payload = (self.apply_fault(who, machine, now, faults.CLAIM) if kind == "fault"
-                           else self.apply_occupied(who, machine, now))
+                           else self.apply_occupied(who, machine, now, held))
         return (entitlements.REPORT_ACCEPTED if status == entitlements.ALLOWED else status), payload
 
     def apply_fault(self, who, machine, now, surface: str = faults.DEVICE) -> tuple[int, dict]:
@@ -995,40 +1042,85 @@ class Application:
                                       "message": "Macchina messa fuori servizio"}
 
     def handle_occupied(self, body, headers, now, path=None):
-        who = self.customer(headers)
-        if who is None:
-            return entitlements.MISSING_SESSION, entitlements.missing_session()
-        machine = self.repo.machine(body.get("machine", ""))
-        if machine is None:
-            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
-        if not entitlements.may_report(who, self.repo.bookings_on_machine(machine["id"], who["email"])):
-            return entitlements.NOT_ENTITLED, entitlements.report_refusal()
-        return self.apply_occupied(who, machine, now)
+        """The still-occupied report, gated on the same decision as the fault report and then narrowed.
 
-    def apply_occupied(self, who, machine, now) -> tuple[int, dict]:
-        self.transition(machine["id"], "cleaning_required", now)
-        booking = next((row for row in self.repo.bookings_for(who["email"])
-                        if row["machine_id"] == machine["id"] and row["state"] in ("confirmed", "unlocked", "running")), None)
+        R7 gives the entitlement to a machine to anybody who has or had a turn on it; R10 narrows the
+        still-occupied claim to the customer the machine is held for right now, because that claim is a
+        statement about the machine that customer is standing in front of (issue #12, AC6). The gate runs
+        before anything is written, and the refusal body is the same one the report surface answers with,
+        so the two paths cannot drift on the permission.
+        """
+        who = self.customer(headers)
+        machine = self.repo.machine(body.get("machine", ""))
+        status, denial = self.report_gate(who, machine, kind="occupied")
+        if status != entitlements.ALLOWED:
+            return status, denial
+        return self.apply_occupied(who, machine, now,
+                                   self.repo.bookings_on_machine(machine["id"], who["email"]))
+
+    def apply_occupied(self, who, machine, now, held=None) -> tuple[int, dict]:
+        """R10's second half: the machine goes out of circulation, the customer is not left standing there.
+
+        Three things the rule says and the seam has to answer with, in one core for both report paths:
+        the machine goes to `cleaning_required` for the window the seed holds (30 minutes, addendum patch
+        2, never a constant here); the customer the claim is read against is moved to a free machine of
+        the same type at the same start time, with a new code and the notification US38 asks for; and when
+        nothing of the type is free the booking is cancelled and the turn refunded so they can rebook at
+        once (US39), which is also what puts the daily count back (R11 counts live bookings only).
+
+        US35 repeat behaviour: a report that lands on a machine already in `cleaning_required` is accepted
+        and the window restarts from the moment it arrives. It is not a hop — the state stands, the buffer
+        is measured again — so the table declares no self-entry for it and the seam does not invent one.
+        """
+        held = held if held is not None else self.repo.bookings_on_machine(machine["id"], who["email"])
+        booking = entitlements.current_booking(who, held)
+        buffer = machine_states.REPEAT_REPORT["restarts"]
+        minutes = self.config[buffer]
+        repeated = machine["state"] == machine_states.REPEAT_REPORT["state"]
+        if repeated:
+            self.restart_window(machine, now)
+        else:
+            self.transition(machine["id"], "cleaning_required", now)
+        self.repo.record_incident("cleaning_required", now, f"reported still occupied on {machine['code']}",
+                                  who["email"], machine["id"], booking["id"] if booking else None)
+        outcome = {"outcome": "cleaning_required", "machine": machine["code"],
+                   "cleaning_minutes": minutes, "clean_until": hhmm(now + timedelta(minutes=minutes)),
+                   "repeat": repeated}
         if booking is None:
-            return entitlements.NOT_ENTITLED, {"error": "no_active_booking", "message": "Nessuna prenotazione attiva su questa macchina"}
+            # The window restarts for the customer who is not standing in front of it any more: the claim is
+            # the record they had, and there is no assignment left here to move.
+            outcome["reassigned"] = None
+            outcome["message"] = "Macchina in pulizia: la finestra riparte da questo momento"
+            return entitlements.ALLOWED, outcome
 
         start = parse(booking["start_time"])
         replacement = self.pick_machine(machine["type"], start)
         if replacement is None:
-            return entitlements.ALLOWED, {"outcome": "cleaning_required", "machine": machine["code"], "reassigned": None,
-                         "message": "Macchina segnata per la pulizia: nessuna macchina libera dello stesso tipo"}
+            self.repo.set_booking_state(booking["id"], "cancelled")
+            self.repo.record_incident("uncoverable", now, "no machine of the type free, turn refunded",
+                                      who["email"], machine["id"], booking["id"])
+            outcome["reassigned"] = None
+            outcome["cancelled"] = booking["code"]
+            outcome["notification"] = {"kind": "cancellation", "booking": str(booking["id"]),
+                                       "message": "Nessuna macchina libera dello stesso tipo: turno rimborsato"}
+            outcome["message"] = "Macchina in pulizia: nessuna macchina libera, turno rimborsato"
+            return entitlements.ALLOWED, outcome
+
         new_code = self.repo.next_code(now)
         self.db.execute("UPDATE bookings SET machine_id = ?, code = ? WHERE id = ?",
                         (replacement["id"], new_code, booking["id"]))
         self.assign(replacement, now)
-        self.repo.record_incident("cleaning_required", now, f"reported still occupied on {machine['code']}",
-                                  who["email"], machine["id"], booking["id"])
-        cleaned_at = now + timedelta(minutes=self.config["cleaning_buffer_minutes"])
-        return entitlements.ALLOWED, {"outcome": "cleaning_required", "machine": machine["code"],
-                     "cleaning_minutes": self.config["cleaning_buffer_minutes"], "clean_until": hhmm(cleaned_at),
-                     "reassigned": {"booking": booking["id"], "machine": replacement["code"], "code": new_code,
-                                    "start": hhmm(start)},
-                     "message": "Macchina in pulizia: sei stato spostato subito"}
+        self.repo.record_incident("reassignment", now, f"moved off {machine['code']}",
+                                  who["email"], replacement["id"], booking["id"])
+        outcome["reassigned"] = {"booking": str(booking["id"]), "machine": replacement["code"],
+                                 "code": new_code, "start": hhmm(start)}
+        # US38: the notification carries the new machine number, because the customer would otherwise walk
+        # to the machine the report was about.
+        outcome["notification"] = {"kind": "reassignment", "booking": str(booking["id"]),
+                                   "machine": replacement["code"],
+                                   "message": f"Sei spostato su {replacement['code']}: nuovo codice {new_code}"}
+        outcome["message"] = "Macchina in pulizia: sei stato spostato subito"
+        return entitlements.ALLOWED, outcome
 
     # --- seed inventory (the machine registry is configuration, not a screen) ---
 
@@ -1269,6 +1361,16 @@ class Application:
         if not machine_states.declares(current, to):
             raise InvalidTransition(current, to, event=event)
         self.repo.set_machine_state(machine_id, to, now)
+
+    def restart_window(self, machine, now) -> None:
+        """US35: the window is re-measured, not re-transitioned.
+
+        `transition` stays the only writer of a machine state. A repeat report writes no state — the machine
+        is already out of circulation for the cleaning window — it moves the moment the buffer is measured
+        from, which is the whole of the repeat behaviour. The table declares no self-hop, so the seam does
+        not invent one.
+        """
+        self.repo.set_machine_state(machine["id"], machine["state"], now)
 
 
 class InvalidTransition(Exception):
