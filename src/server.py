@@ -9,6 +9,10 @@ code (docs/spec.md, Observability shape). The query parameters of the public rea
 `type`) join the body of the call, and the logged line is the path without them. The line itself is
 written by `src/telemetry.py`, because that is where the credential guard lives: a line that would
 carry a credential is refused before it is stored or printed, so nothing here can log one.
+
+Every contract entry answers with JSON. A view read (issue #20, `src/views.py`) answers with the page
+itself, so a string payload is written as text/html and not wrapped in quotes: the seam, the handlers,
+the statuses and the entitlements are the same, and the front-end reads both the same way.
 """
 
 import json
@@ -33,9 +37,13 @@ def make_handler(app: Application):
             query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
             body = json.loads(self.rfile.read(length) or b"{}") if length else {}
             status, payload = app.handle(method, self.path.split("?")[0], {**query, **body}, dict(self.headers))
-            raw = json.dumps(payload).encode()
+            # A view read answers with the page itself: the front-end reads it as text, so a string payload
+            # is written as text/html and not wrapped in quotes. Every other answer stays JSON — the seam the
+            # tests drive is unchanged.
+            raw = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/html; charset=utf-8" if isinstance(payload, str)
+                             else "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
