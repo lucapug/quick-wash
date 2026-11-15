@@ -23,12 +23,12 @@ What is asserted here, criterion by criterion:
   to — read through `GET /api/bookings`, the contract entry that carries it as the R9 block. The two refusals
   the rule has are asserted too: a machine that is not `unlocked` is not a lost turn, and a machine with no
   booking attached has no turn to close.
-- **AC5** — a device fault from a customer who has or had a booking on the machine drives `maintenance`,
-  and the refusal of a stranger writes nothing.
+- **AC5** — a device fault from a customer who has or had a booking on the machine drives `maintenance`, and
+  the refusal of a stranger writes nothing.
 - **AC6** — the contract is the same two calls a real controller would use: nothing in the device module is a
   protocol, a service or a transport of its own.
-- **AC7** — every device call carries the journey trace of the booking it belongs to, and a call that
-  carries a foreign one is refused before anything is written.
+- **AC7** — every device call carries the journey trace of the booking it belongs to, and a call that carries
+  a foreign one is refused before anything is written.
 
 Nothing is mocked: the client posts over 127.0.0.1, the repository is a real database, and the clock the test
 controls is the clock behind the seam that the simulator is handed as a dependency.
