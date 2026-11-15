@@ -236,6 +236,13 @@ class Application:
         # second insert — not a pre-check that could have been read before the other request wrote.
         with self.db.snapshot():
             self.resolve_buffers(self.clock.now())
+            # The idle-open bound is evaluated at report time and on every read (issue #13, Decision). The two
+            # are not the same moment: a report the device sends is the fact it observed, and the read is the
+            # request that notices the fact for somebody who never sent anything. Running the bound before a
+            # report would answer the report with a hop already taken, so a report writes its own fact and the
+            # read writes it only when nothing has been reported.
+            if method == "GET":
+                self.resolve_idle_opens(self.clock.now())
             try:
                 status, payload = getattr(self, f"handle_{name}")(body or {}, headers or {}, path)
             except InvalidTransition as bad:
@@ -309,6 +316,27 @@ class Application:
                 continue
             if now - parse(machine["changed_at"]) >= timedelta(minutes=self.config[key]):
                 self.transition(machine["id"], "available", now)
+
+    def resolve_idle_opens(self, now) -> None:
+        """The same predicate, on the read side (issue #13, Decision).
+
+        There is no scheduler in this project, so the rule has to be evaluated where the facts are read: at
+        report time and on every request that reads the shop. The open is the recorded fact, the bound is
+        `src/machine_states.py`'s single predicate — the one the device reads too — and the closure is the
+        same core a report runs, so the device and the read cannot write the fact twice.
+        """
+        for machine in self.repo.machines():
+            if machine["state"] != "unlocked":
+                continue
+            booking = self.repo.open_booking(machine["id"])
+            if booking is None:
+                continue
+            opened = parse(booking["redeemed_at"]) if booking["redeemed_at"] else None
+            # The machine being `unlocked` is the recorded fact that no cycle was reported on it: a reported
+            # cycle would have moved it to `running`, so the open is still an idle open.
+            if not machine_states.idle_open_due(opened, now, self.config):
+                continue
+            self.close_idle_open(machine, booking, now)
 
     # --- identity (issue #9) -------------------------------------------------
 
@@ -388,8 +416,12 @@ class Application:
         """
         if booking is None:
             return None
-        self.journey = self.telemetry.journey(booking["id"])
-        return self.journey
+        # The identifier is the same value on both sides of the seam: what the recorder writes on the request
+        # line is what the answer carries, so a device call that carries a journey can be checked against the
+        # journey the booking actually has (issue #13, AC7). `self.journey` is therefore the key the recorder
+        # resolves, and the returned value is the identifier it resolves to.
+        self.journey = booking["id"]
+        return self.telemetry.journey(self.journey)
 
     def who_is_asking(self, headers) -> dict:
         """Who the seam is answering: a customer with a session, or the observer without one.
@@ -948,7 +980,7 @@ class Application:
         now = self.clock.now()
         window = rules.grace_window(parse(booking["start_time"]), self.config)
         machine = self.repo.machine_by_id(booking["machine_id"])
-        self.trace(booking)
+        journey = self.trace(booking)
 
         if booking["state"] == "confirmed" and not rules.in_window(now, window, self.config):
             if now < window[0]:
@@ -981,7 +1013,10 @@ class Application:
             self.transition(machine["id"], "unlocked", now, event="redeem")
         self.repo.set_booking_state(booking["id"], "unlocked")
         self.repo.record_open(booking["id"], now)
+        # AC7 (issue #13): the answer to the keypad call carries the journey the call belongs to, so the
+        # device carries that identifier on every later call instead of inventing one.
         return 200, {"outcome": "unlocked", "machine": machine["code"], "tokens_required": booking["tokens"],
+                      "trace": journey,
                       "grace_window": {"from": hhmm(window[0]), "to": hhmm(window[1])}}
 
     def handle_report(self, body, headers, path=None):
@@ -999,7 +1034,15 @@ class Application:
         if booking is None:
             # A device report is about a machine: the booking it belongs to is the one still attached.
             booking = self.repo.open_booking(machine["id"])
-        self.trace(booking)
+        journey = self.trace(booking)
+
+        # AC7 (issue #13): the device call carries the journey of the booking it belongs to. A call that
+        # carries a foreign one is refused before anything is written, and the answer names the journey the
+        # machine is actually on.
+        asked = body.get("trace")
+        if asked is not None and journey is not None and asked != journey:
+            return 400, {"error": "trace_not_this_journey", "journey": journey, "trace": asked,
+                         "message": "La chiamata porta un journey che non è quello di questa prenotazione"}
 
         # The two reports that name a customer are entitlement-gated (R7).
         if event == "fault":
@@ -1037,23 +1080,37 @@ class Application:
         booking, releases the machine through the declared hop `unlocked -> available`, counts the
         no-show (R9) and records the incident."""
         if booking is None:
-            return 404, {"outcome": "unknown_code", "message": "Nessuna prenotazione aperta su questa macchina"}
+            # Nothing to close, so nothing to count: the record the rule would act on is not there (404),
+            # and the fact is not written. This is also what stops the same lost turn from being counted
+            # twice — a closed booking is no longer a turn attached to the machine.
+            return 404, {"error": "booking_not_found", "outcome": "unknown_code",
+                         "message": "Nessuna prenotazione aperta su questa macchina"}
         self.trace(booking)
         if machine["state"] != "unlocked":
             raise InvalidTransition(machine["state"], "available", event="idle_open")
         opened = parse(booking["redeemed_at"]) if booking["redeemed_at"] else None
-        idle = now - opened if opened else timedelta(0)
-        if idle < timedelta(minutes=self.config["idle_open_minutes"]):
+        if not machine_states.idle_open_due(opened, now, self.config):
+            idle = now - opened if opened else timedelta(0)
             return 409, {"error": "too_early", "event": "idle_open",
                           "message": "idle_open richiede almeno 15 minuti dall'apertura",
                           "idle_minutes": int(idle.total_seconds() // 60)}
+        return 200, self.close_idle_open(machine, booking, now)
+
+    def close_idle_open(self, machine, booking, now) -> dict:
+        """The facts the event leaves, written once, from the recorded open.
+
+        The same fact is written by a report and by a read, so it is one function: the closure of the turn,
+        the release of the machine through the declared hop, the no-show on the counter of the customer the
+        booking belongs to (R9), and the incident. A refusal never reaches these lines.
+        """
+        self.trace(booking)
         self.repo.set_booking_state(booking["id"], "closed")
         self.transition(machine["id"], "available", now, event="idle_open")
         self.repo.record_no_show(booking["email"], now, booking["id"])
         incident = self.repo.record_incident("idle_open", now, "machine opened, cycle never started",
                                              booking["email"], machine["id"], booking["id"])
-        return 200, {"outcome": "closed", "machine": machine["code"], "incident": incident["kind"],
-                     "message": "Turno perso: macchina liberata"}
+        return {"outcome": "closed", "machine": machine["code"], "incident": incident["kind"],
+                "message": "Turno perso: macchina liberata"}
 
     def handle_fault(self, body, headers, now, path=None):
         """The same entitlement as the booking surface, read through the report path.

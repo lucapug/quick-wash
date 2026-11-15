@@ -143,6 +143,44 @@ KNOWN_CONTRADICTIONS = {
     # tests/integration/test_booking_creation_happy_path.py), and its `advance(minutes=11)` closes a grace
     # window only for a slot that has already begun, so the counter it then reads cannot be fed. The two
     # files are both pinned, so the entry stands until a human corrects one side.
+    # Issue #13 (the device boundary): the domain reacts only to what the device actually reported, so the R6
+    # table declares no `unlocked -> finished` hop — `cycle_finished` is the fact of a cycle the device saw
+    # begin, and a report that names the end of a cycle it never saw start is an assumption, not a fact. The
+    # file issue #10 (R10) supplies cannot reach its outcome from that side: it sends a `cycle_finished` report
+    # for a cycle it never reported starting, the seam refuses the hop and writes nothing, so the machine is
+    # never inside the turnover buffer, the second customer is assigned to the other machine of the type and
+    # the `still_occupied` claim that follows lands on a machine that is `unlocked`, not `finished`. R10 as an
+    # outcome — the buffer measured from the moment a report the device can make arrives, the machine released
+    # when the buffer passes, the claim that moves the claimant off it — is read back in
+    # tests/integration/test_r10_turnover_and_cleaning_coverage.py. The supplied file is not modified, so the
+    # entry stands until a human decides which side moves.
+    ("test_r10_turnover_and_cleaning.py",
+     "test_next_assigned_customer_reports_and_is_reassigned_immediately"):
+        "issue #13: the supplied report names the end of a cycle the device never reported starting, so the "
+        "seam refuses the hop (409, `unlocked -> finished` is not declared) and the machine is never in its "
+        "turnover buffer; the machine the second customer is assigned to is therefore the other machine of "
+        "the type, and the `still_occupied` claim that follows is refused because the machine is `unlocked`, "
+        "not `finished`. Every R10 fact the file asserts is answered as supplied when the report is one the "
+        "device can actually make — the buffer measured from the moment the report arrives, the release after "
+        "it, the reassignment of the claimant — read back in "
+        "tests/integration/test_r10_turnover_and_cleaning_coverage.py. Both files are pinned, so the "
+        "contradiction needs a human on which side moves.",
+
+    # The same invariant on the read side. Issue #13's Decision puts the 15-minute bound on every read, so the "
+    # read of a machine left open for an hour with no `cycle_started` is the request that closes the turn: "
+    # booking `closed`, machine `available`, incident `idle_open`. The coverage file of issue #14 (R3) pins the "
+    # opposite outcome for that read — `unlocked`, sixty minutes after the open — because the fact it is making "
+    # is that no timer moves a machine. That fact still holds (nothing moved it to `running`); what moved it is "
+    # the rule, read at the moment of the read. Both files are pinned, so the entry stands until a human "
+    # decides which side moves.
+    ("test_r03_grace_and_redemption_coverage.py",
+     "test_a_redemption_never_starts_a_cycle_and_no_timer_does"):
+        "issue #13, Decision: the idle-open bound is evaluated at report time and at every read, so the read "
+        "sixty minutes after the open closes the turn and answers `available`, not `unlocked`; the no-timer "
+        "fact the test is making is untouched (no timer moved it to `running`) and is read back in "
+        "tests/integration/test_device_reports_coverage.py (AC2). Both files are pinned, so the contradiction "
+        "needs a human on which side moves.",
+
     ("test_r09_no_show_block.py", "test_block_is_enforced_and_shown_with_reason_and_expiry"):
         "issue #18: the supplied test books 09:00 with the clock at 09:00, the slot that has already begun "
         "(issue #45, AC3), so the 422 tests/integration/test_booking_creation_happy_path.py pins for that "

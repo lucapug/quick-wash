@@ -18,7 +18,14 @@ Two names are deliberately absent from `STATES`:
   closes the booking, releases the machine (`unlocked → available`) and records an incident.
 - `expired` is a terminal state of a **booking**, never of a machine. A booking that expires leaves
   its machine `available`.
+
+The invariant R6 and the device boundary share (issue #13): a hop exists only when the device reported the
+fact it names. `cycle_finished` is declared from `running` alone, because the machine got there on a
+`cycle_started` report. A report that names the end of a cycle the device never saw begin is not a fact, it
+is an assumption, and the table refuses it — the refusal, not a coercion, is what `AC 6` asks for.
 """
+
+from datetime import timedelta
 
 STATES = ("available", "reserved", "unlocked", "running", "finished", "cleaning_required", "maintenance")
 
@@ -41,10 +48,12 @@ TRANSITIONS = {
     "reserved": {"unlocked", "available", "maintenance", "cleaning_required"},
     # `available` here is the `idle_open` release: the event is not a state, so its effect is the
     # declared hop out of `unlocked`.
-    # `finished` is the device's own fact: the controller decides when a cycle ends (issue #15), and it
-    # can name that fact without having named the start first. R10 measures the turnover buffer from the
-    # moment the report arrives, so the hop the report names has to be declared, not refused.
-    "unlocked": {"running", "available", "maintenance", "finished"},
+    # `finished` is not declared from here. The device decides when a cycle ends (issue #15), but it can
+    # only name the end of a cycle it named the start of: the seam reacts to what the device actually
+    # reported, so a report that jumps from the open straight to the end is refused with 409 and writes
+    # nothing (issue #13, AC3, `tests/integration/test_device_reports_coverage.py`). The hop R10 measures
+    # its turnover buffer from is the one `running -> finished` declares.
+    "unlocked": {"running", "available", "maintenance"},
     # AC 6: `running → available` is not declared — a cycle must pass through `finished`.
     "running": {"finished"},
     "finished": {"available", "cleaning_required", "maintenance"},
@@ -94,6 +103,22 @@ HOLDING_STATES = ("confirmed", "unlocked", "running")
 
 # The names that must never appear as a machine state.
 NOT_STATES = ("idle_open", "expired")
+
+
+def idle_open_due(opened_at, now, config: dict, cycle_started=None) -> bool:
+    """The 15-minute bound, in one predicate, read by both sides of the device boundary.
+
+    The seam evaluates it on every request that reads a machine (issue #13's Decision: the rule is
+    evaluated at report time and at every read, from the recorded open) and the simulator reads the same
+    function, so the bound cannot be reached twice — once by the device and once by the read. An open that
+    already has a cycle started is not an idle open, and an open that is not recorded is not an open at all.
+
+    Inclusive on the bound, the way R3 and R10 measure theirs: the fifteenth minute is the minute the event
+    fires.
+    """
+    if opened_at is None or cycle_started is not None:
+        return False
+    return (now - opened_at) >= timedelta(minutes=config["idle_open_minutes"])
 
 
 def declares(current: str, to: str) -> bool:
