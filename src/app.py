@@ -127,11 +127,23 @@ read against (the fork `src/faults.py` records for the human decision). A custom
 machine is moved immediately rather than sent through a support process, because there is no staff to ask:
 when the code was already redeemed the machine is released from her turn and the cycle still ahead moves with
 the record.
+
+R11 (issue #21) is the day's allowance, read on the shop's own day: `Europe/Rome`, resetting at 00:00 local,
+and counted on the moment a booking was created rather than on the slots it is active in, because R11 says
+"independent of overlap" — a customer holding two slots is refused even when both are already in the past of
+the day. The two decisions are `src/daily_limit.py`, in one place, and the guarantee is the UNIQUE
+`(email, day, seat)` index in `src/repository.py`: the seat a request computes from its own snapshot can be a
+seat another request already holds, and the insert is what refuses it, exactly as the slot index refuses the
+loser of a race for a machine. A refusal writes nothing. A cancelled booking has no seat row, so the refund is
+literally the right to rebook, and the customer's own view (`GET /api/customers/me`, `GET /api/bookings`) and
+the 409 that answers her third attempt read the same shape from the same rows — the limit, the count used, the
+moment it resets — before any refusal happens. The order is the rule's: the R9 gate answers before the
+allowance is read, so a blocked customer is refused for the block and the answer never also names the limit.
 """
 
 from datetime import datetime, timedelta
 
-from src import alternatives, availability, cancellation, domain, entitlements, faults, machine_states, rules
+from src import alternatives, availability, cancellation, daily_limit, domain, entitlements, faults, machine_states, rules
 from src import notifications
 from src import identity as credentials
 from src.clock import Clock
@@ -673,16 +685,19 @@ class Application:
                 "message": "Lo slot scelto non può essere rispettato",
             }
 
-        used = self.daily_limit(who, start.date())["used"]
-        limit = self.config["bookings_per_day"]
-        if used >= limit:
-            return 409, {
-                "error": "daily_limit",
-                "limit": limit,
-                "used": used,
-                "resets_at": f"{start.date().isoformat()} 23:59",
-                "message": f"Massimo {limit} prenotazioni al giorno: hai già {used}",
-            }
+        # R11 (issue #21), the two decisions in `src/daily_limit.py`: the day is the shop's own day in
+        # `Europe/Rome`, and the count is the bookings created on it, not the ones active on it. The block
+        # gate has already answered, so what is read here is the allowance of a customer who is not blocked
+        # (AC6): a blocked customer is refused for the block and the refusal never also names the limit,
+        # because the limit is not the rule that refused her.
+        day = daily_limit.local_day(now, self.config)
+        rows = self.repo.day_seats(who["email"], day.isoformat())
+        allowance = daily_limit.view(rows, day, self.config)
+        seat = daily_limit.next_seat(daily_limit.seats(rows), self.config)
+        if seat is None:
+            # The day is full as this request read it. A refusal is a decision, not a write.
+            self.telemetry.count("customer_blocked_total", journey=self.journey)
+            return 409, daily_limit.refusal(rows, day, self.config)
 
         machine = self.pick_machine(type_key, start)
         if machine is None:
@@ -711,9 +726,19 @@ class Application:
                 "error": "slot_taken",
                 "enforced_by": "persistence layer",
                 "alternatives": alternatives.takeable(self.repo, self.config, type_key, start, now,
-                                                       remaining=limit - used),
+                                                       remaining=allowance["remaining"]),
                 "message": "Lo slot è stato assegnato a un altro cliente: scegli un orario alternativo",
             }
+
+        # R11's guarantee is this insert, not the line above: the seat was computed from the snapshot the
+        # request read, so two concurrent requests for the same day can name the same seat and the UNIQUE
+        # `(email, day, seat)` index is what refuses one of them (AC7) — the same pattern R5 uses for a
+        # machine and a slot. A refusal writes nothing: the rollback takes the booking back with the seat, so
+        # the loser leaves neither behind, and `used` in the answer is the count the layer has after the
+        # decision rather than the count this request had before it.
+        if self.repo.take_seat(who["email"], day.isoformat(), seat, booking["id"], now) is None:
+            self.telemetry.count("customer_blocked_total", journey=self.journey)
+            return 409, daily_limit.refusal(self.repo.day_seats(who["email"], day.isoformat()), day, self.config)
 
         self.trace(booking)
         self.assign(machine, now)
@@ -740,7 +765,9 @@ class Application:
         if who is None:
             return 401, {"error": "sign_in_required", "message": "Entra con email e codice"}
         now = self.clock.now()
-        today = now.date()
+        # R11 read on the shop's own day (issue #21): the same `daily_limit.view` the refusal answers with,
+        # so the list and the 409 cannot state two different numbers for the same day.
+        today = daily_limit.local_day(now, self.config)
         rows = [self.resolve_expiry(row) for row in self.repo.bookings_for(who["email"])]
         return 200, {
             "bookings": [self.booking_view(row) for row in rows],
@@ -774,7 +801,10 @@ class Application:
             "no_shows_in_window": block["no_shows"],
             "block": block,
             "bookings": [self.booking_view(row) for row in self.repo.bookings_for(who["email"])],
-            "limit": self.daily_limit(who, now.date()),
+            # AC3 (issue #21): the limit and the moment it resets are on the customer's own view before any
+            # refusal happens, for the same reason US51 asks for the block there — a customer who is refused
+            # without being told why, and until when, cannot correct the behaviour.
+            "limit": self.daily_limit(who, daily_limit.local_day(now, self.config)),
             "message": block["message"],
         }
 
@@ -810,17 +840,18 @@ class Application:
     def daily_limit(self, who, day) -> dict:
         """R11 as the customer reads it (US48): the limit, what is used, what is left, when it resets.
 
-        In one place, so the customer's list and the customer's view cannot disagree about the same day.
-        Cancelled bookings do not count, which is what makes US45 true on the read as well as on the write,
+        In one place, so the customer's list, the customer's view and the 409 that answers her third attempt
+        cannot disagree about the same day. `used` is the count of the day's rows in the layer — the same
+        count the UNIQUE `(email, day, seat)` index decides on — so the rule has one source and the copy is
+        built from the fact rather than from a second reading of it.
+
+        A cancelled booking has no row, which is what makes US45 true on the read as well as on the write,
         and what makes R8's refund real: an uncoverable cancellation does not consume the allowance (issue
         #19, AC3) — there is no money in this product, so the refund is the right to rebook, and a turn the
-        customer lost to a fault she did not cause cannot be the turn that blocks her.
+        customer lost to a fault she did not cause cannot be the turn that blocks her. A turn lost to a
+        no-show keeps its row: the allowance was consumed by a turn that was not given back.
         """
-        used = len([row for row in self.repo.bookings_for(who["email"])
-                    if parse(row["start_time"]).date() == day and row["state"] != "cancelled"])
-        limit = self.config["bookings_per_day"]
-        return {"max_per_day": limit, "used": used, "remaining": limit - used,
-                "resets_at": f"{day.isoformat()} 23:59"}
+        return daily_limit.view(self.repo.day_seats(who["email"], day.isoformat()), day, self.config)
 
     def machine_bookings(self, code) -> tuple[int, dict | list]:
         """The machine-scoped read: the bookings attached to the machine the request names.
@@ -916,6 +947,10 @@ class Application:
             # been read; here the machine is committed to a turn, so the state is the whole of the answer.
             return 409, cancellation.refusal(booking, machine, self.config, now, start, cancellation.STATE_REFUSED)
         self.repo.set_booking_state(booking["id"], "cancelled")
+        # R11 (issue #21): the seat goes back with the turn. There is no money in this product, so the refund
+        # US45 asks for is the right to rebook, and that right is the row this line removes — the same fact the
+        # customer's view reads as `used`, so the read and the write cannot disagree about her day.
+        self.repo.release_seat(booking["id"])
         if machine is not None and machine["state"] == "reserved":
             # US45: the slot becomes bookable by others at once. No buffer is charged for a cancellation —
             # the buffer is the hop that follows a cycle actually run (R10), and this is the declared hop
@@ -1325,6 +1360,7 @@ class Application:
                 # US39: told honestly, and the turn is given back — the refund is the right to rebook, so the
                 # day's count goes back with the booking and she can take a slot at once.
                 self.repo.set_booking_state(booking["id"], "cancelled")
+                self.repo.release_seat(booking["id"])
                 cancelled.append(booking["code"])
                 self.repo.record_incident("uncoverable", now, "no machine of the type free, turn refunded",
                                           booking["email"], machine["id"], booking["id"])
@@ -1411,6 +1447,7 @@ class Application:
         replacement = self.pick_machine(machine["type"], start)
         if replacement is None:
             self.repo.set_booking_state(booking["id"], "cancelled")
+            self.repo.release_seat(booking["id"])
             self.repo.record_incident("uncoverable", now, "no machine of the type free, turn refunded",
                                       who["email"], machine["id"], booking["id"])
             outcome["reassigned"] = None
