@@ -90,13 +90,19 @@ jobs:
           N: ${{ steps.prinfo.outputs.n }}
         run: |
           V="${{ steps.rev.outputs.verdict }}"; T="${{ steps.tests.outputs.result }}"; TP="${{ steps.tamper.outputs.result }}"; R="${{ steps.rev.outputs.reviewer }}"
-          if [ "$R" = "needs-human" ]; then
-            # needs-human at verdict: NON coerzare a CHANGES_REQUESTED, fermarsi senza ri-accodo
-            VE="needs-human"; STATE=failure; LABEL="review:needs-human"
-          else
-            VE="$V"; [ "$TP" = "fail" ] && VE="CHANGES_REQUESTED"
-            STATE=failure; LABEL="review:changes-requested"
-            if [ "$VE" = "APPROVED" ] && [ "$T" = "pass" ]; then STATE=success; LABEL="review:approved"; fi
+          # needs-human at verdict (patch #4 estesa, policy-fix 15/11): Reviewer
+          # vuoto/assente, tamper-fail e gate pytest fail = allarmi, NON feedback:
+          # label review:needs-human e stop, niente ri-accodo (tamper-fail: la fence
+          # e immutabile; gate fail: precedente #48).
+          NH=0
+          if [ -z "$R" ] || [ "$R" = "needs-human" ]; then NH=1; VE="needs-human"
+          elif [ "$TP" = "fail" ] || [ "$T" = "fail" ]; then NH=1; VE="needs-human"
+          else VE="$V"
+          fi
+          STATE=failure
+          if [ "$NH" = 1 ]; then LABEL="review:needs-human"
+          elif [ "$VE" = "APPROVED" ] && [ "$T" = "pass" ]; then STATE=success; LABEL="review:approved"
+          else LABEL="review:changes-requested"
           fi
           {
             echo "**Review indipendente ($R, gate pytest) — factory V2**"
@@ -109,9 +115,9 @@ jobs:
           gh pr edit "$PR_NUMBER" --add-label "$LABEL"
           gh api "repos/$GH_REPO/statuses/$SHA" -f state="$STATE" -f context="prime-review" -f description="verdict=$VE tests=$T tamper=$TP reviewer=$R" \
             || echo "warn: commit status non postato (PAT senza permesso Commit statuses) — non fatale"
-          if [ "$R" = "needs-human" ]; then
+          if [ "$NH" = 1 ]; then
             gh issue edit "$N" --add-label review:needs-human
-            echo "needs-human: issue #$N marcata, nessun ri-accodo (stop alla review)"
+            echo "needs-human: issue #$N marcata, nessun ri-accodo (allarme, stop alla review)"
           elif [ "$VE" != "APPROVED" ]; then
             ATT="$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[].body | select(contains("CHANGES_REQUESTED"))] | length')"
             if [ "$ATT" -lt 3 ]; then

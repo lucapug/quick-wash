@@ -29,15 +29,15 @@ verificare lo stato del residente Z1 su Minisforum :8081.
 EOF
 }
 
-# pre-check rapido: il residente e sempre up, se muta e un allarme vero —
-# needs-human subito senza attendere il timeout della review completa
-if ! curl -s --max-time 8 -K "$HDR" "${REVIEWER_BASE_URL%/}/models" -o /dev/null 2>/dev/null; then
-  needs_human
-  echo "$REVIEWER"
-  exit 0
-fi
-
-python3 - "$PROMPT" > "$REQ" <<'PY'
+# Pre-check e chiamata completa: un solo retry (sleep 20s) prima del verdetto
+# canned (policy-fix ratificato al checkpoint 14/11, applicato 15/11): un
+# transitorio di rete non e un allarme; il canned esce solo al 2 fallimento
+# consecutivo. Il canned resta allarme vero quando il residente e giu davvero.
+attempt() {
+  if ! curl -s --max-time 8 -K "$HDR" "${REVIEWER_BASE_URL%/}/models" -o /dev/null 2>/dev/null; then
+    return 1
+  fi
+  python3 - "$PROMPT" > "$REQ" <<'PY'
 import json, sys
 print(json.dumps({
     "model": "glm-z1-9b-0414",
@@ -46,8 +46,7 @@ print(json.dumps({
     "max_tokens": 4000,
 }))
 PY
-
-if curl -s --max-time 240 -K "$HDR" \
+  curl -s --max-time 240 -K "$HDR" \
      --data-binary @"$REQ" \
      "${REVIEWER_BASE_URL%/}/chat/completions" \
      -o "$RESP" 2>/dev/null \
@@ -64,12 +63,17 @@ if not c.strip():
 # quindi gli spazi iniziali vanno tolti o ogni review risulterebbe rifiutata
 open(sys.argv[2], "w").write(c.lstrip())
 PY
-then
-  REVIEWER="glm-z1-9b-0414"
-fi
+}
 
-if [ "$REVIEWER" = "needs-human" ]; then
-  needs_human
+if attempt; then
+  REVIEWER="glm-z1-9b-0414"
+else
+  sleep 20
+  if attempt; then
+    REVIEWER="glm-z1-9b-0414"
+  else
+    needs_human
+  fi
 fi
 
 echo "$REVIEWER"
