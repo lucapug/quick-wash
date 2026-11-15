@@ -39,6 +39,27 @@ DEVICE = "device"
 CLAIM = "claim"
 PANEL = "panel"
 
+# The incident a taken report leaves behind, per surface, in one line per surface.
+#
+# `fault` is the fact the report asserts, so it is recorded on the two paths where the report is a statement
+# about the machine as such: the customer's claim and the device's own fact. The panel is the third surface
+# and the only one that is not a report about a fault — the owner is deciding to take a machine out of
+# service, and that decision already records its own incident (`maintenance`) in `handle_owner_maintenance`.
+# `None` is therefore not a missing record: it is what keeps one action from being written twice, and it is
+# what keeps the panel's incident list the owner reads the list of the owner's own actions.
+INCIDENT_KIND = "fault"
+INCIDENT_KINDS = {DEVICE: INCIDENT_KIND, CLAIM: INCIDENT_KIND, PANEL: None}
+
+
+def incident_kind(surface: str) -> str | None:
+    """Which incident a taken report records, read from the surface it arrived on.
+
+    The fault incident is written on the claim surface and on the device boundary; the panel reports nothing
+    here because its own action is already recorded as the owner's decision. This is the whole of the
+    decision, so the incident a report leaves behind cannot depend on which handler ran.
+    """
+    return INCIDENT_KINDS.get(surface)
+
 
 def entitled_booking(who, bookings) -> dict | None:
     """The record the report entitlement is read against (R7): the caller's own booking on that machine.
@@ -46,6 +67,11 @@ def entitled_booking(who, bookings) -> dict | None:
     `src/entitlements.py` answers `may_report` from the truthiness of this same list; here the record itself
     is what matters, because the rule is about that record and not about its existence, and `may_move` is read
     against it.
+
+    The list is every row the machine carries for that identity, whatever state the record is in — live,
+    `cancelled`, `expired`, `closed` — because R7's "or had" is a fact about a persisted booking, not a
+    session flag: a turn that is over still entitles the person who had it. The earliest row is the record
+    named here, so the same reading is what `may_move` is checked against on the claim surface.
     """
     return next((row for row in bookings if row["email"] == who["email"]), None)
 

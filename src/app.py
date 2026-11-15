@@ -61,7 +61,10 @@ what they can differ on is the residue the report is allowed to write, and that 
 202: the report is a claim the seam takes, not a fact a device reports, and its consequence is applied to the
 machine. Reassignment (R8) is its own issue, and the claim surface is the one place its residue is narrower:
 the claim is admitted by a booking record, so it cannot rewrite the record that admits it, and the machine
-keeps exactly its entitled pre-report booking (issue #11, slice b2, AC3). The decision is `src/faults.py`, in one predicate, run by `apply_fault`.
+keeps exactly its entitled pre-report booking (issue #11, slice b2, AC3). The decision is `src/faults.py`, in
+one predicate, run by `apply_fault`, and the incident the taken report leaves behind is the same file read per
+surface — `fault` on the claim and on the device boundary, the owner's own action on the panel — so the
+reviewer's demo and the test run one implementation.
 
 Issue #11, slice b1 is the persistence constraint and the loser path only: the UNIQUE
 `(machine_id, start_time)` index is what decides a race for one slot, the loser is answered 409 with the
@@ -1216,10 +1219,22 @@ class Application:
         and on the claim surface the record the entitlement was read against stays (issue #11, slice b2, AC3)
         — the machine keeps exactly that one booking, because every other future booking still runs R8 and
         nothing new can be attached to a machine in `maintenance`. A refusal never reaches this line at all.
+
+        The incident the report leaves behind is read from the same file, in the same call, so the three paths
+        cannot write three different things: `fault` on the claim surface and on the device boundary, nothing
+        here on the panel, whose own action is recorded by the toggle. The record named on the incident is the
+        one the entitlement was read against — the persisted booking, not a session flag — so the incident list
+        the reviewer reads is the same fact the gate was answered with. This is also the single code path the
+        deterministic trigger of issue #24 uses: the trigger is a request on one of these surfaces, so the demo
+        and the test exercise one implementation.
         """
         self.transition(machine["id"], "maintenance", now)
         held = self.repo.bookings_on_machine(machine["id"])
         record = faults.entitled_booking(who, held)
+        kind = faults.incident_kind(surface)
+        incident = (self.repo.record_incident(kind, now, f"fault reported on {machine['code']}",
+                                             who["email"], machine["id"], record["id"] if record else None)
+                    if kind else None)
         reassigned, cancelled, kept = [], [], []
         for booking in held:
             start = parse(booking["start_time"])
@@ -1246,6 +1261,7 @@ class Application:
             self.repo.record_incident("reassignment", now, f"moved off {machine['code']}",
                                       booking["email"], replacement["id"], booking["id"])
         return entitlements.ALLOWED, {"outcome": "maintenance", "machine": machine["code"],
+                                      "incident": incident["kind"] if incident else None,
                                       "reassigned": reassigned, "cancelled": cancelled, "kept": kept,
                                       "message": "Macchina messa fuori servizio"}
 
