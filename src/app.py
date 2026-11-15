@@ -35,6 +35,16 @@ the block and its expiry before any booking attempt (US51), and it is the same `
 cannot disagree about what the customer is blocked for or until when. It needs a session, because a caller
 with no identity has no counter to read.
 
+The customer frontend (issue #20) is the sixth pattern: `GET /api/views/<screen>` renders the four screens
+the customer reads (availability, sign-in, book, my bookings) from `src/views.py`. It is a presentation
+read over the same seam the tests drive, not a backend-for-frontend layer — the Decision of the issue
+names React (Vite) plus Bootstrap CSS and no layer between the client and the tested seam — so `ROUTES`
+stays exactly the eight entries tests/conftest.py pins. Copy and shape live in `src/views.py`; the gate on
+the two customer pages is the same decision as the booking surface (401 for a caller with no session), so
+the read is refused at the seam and not hidden by the page, and the unlock code appears only inside the
+customer's own booking. The static copy is English (the issue's Decision overrides AC1); the domain copy the
+tests pin is shown as-is.
+
 The unlock code and its grace window (issue #14, R3): the code is the booking's own numeric code, six
 digits as the machine keypad reads it, tied to one row and redeemed once on `POST /api/lock/redeem` inside
 `[start - 10, start + 10]`, inclusive on both bounds. The four outcomes of that path are fixed:
@@ -145,6 +155,7 @@ from datetime import datetime, timedelta
 
 from src import alternatives, availability, cancellation, daily_limit, domain, entitlements, faults, machine_states, rules
 from src import notifications
+from src import views
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import counters
@@ -165,6 +176,15 @@ ROUTES = {
 }
 
 SEAM_PATHS = sorted(f"{method} {path}" for method, path in ROUTES)
+
+# The customer frontend (issue #20): the four screens, as a pattern over the seam. `ROUTES` stays exactly
+# the eight entries tests/conftest.py pins — the frontend is a presentation read over the same HTTP seam
+# the tests use, not a backend-for-frontend layer, so a view read is a pattern like the per-machine read,
+# the code read and the notification read. Copy and shape live in `src/views.py`; the gate on the two
+# customer pages is the same decision as the booking surface (401 for a caller with no session), so the
+# read is refused at the seam and not hidden by the page.
+CUSTOMER_VIEW = ("GET", "/api/views/")
+VIEW_SCREENS = views.SCREENS
 
 # The write that belongs to the seed inventory, on the contract path of its read. It takes `type`
 # and nothing else: there is no per-machine price or duration field to override, so the only thing
@@ -316,6 +336,10 @@ class Application:
             return f"owner_{surface[0].replace('-', '_')}"
         if method == REPORT_SURFACE[0] and path.startswith(REPORT_SURFACE[1]) and path.endswith("/report"):
             return "machine_report"
+        if method == CUSTOMER_VIEW[0] and path.startswith(CUSTOMER_VIEW[1]):
+            segment = path[len(CUSTOMER_VIEW[1]):].strip("/")
+            if segment in VIEW_SCREENS:
+                return "view_" + segment.replace("-", "_")
         if method == PER_MACHINE_READ[0] and path.startswith(PER_MACHINE_READ[1]):
             return "machine"
         if path.startswith(BOOKING_SURFACE[1]):
@@ -437,6 +461,22 @@ class Application:
         return 200, {"email": email, "token": token, "is_owner": bool(who["is_owner"]),
                       "session_persisted": True,
                       "message": "Entra: il token resta e ti riconosce alla prossima visita"}
+
+    def handle_view_availability(self, body, headers, path=None):
+        """The availability screen, answered to a caller with no session (issue #20, AC2)."""
+        return views.render(self, "availability", body, headers)
+
+    def handle_view_sign_in(self, body, headers, path=None):
+        """The sign-in screen: email and the code shown in-app, and no password field (AC5)."""
+        return views.render(self, "sign-in", body, headers)
+
+    def handle_view_book(self, body, headers, path=None):
+        """The booking screen: machine, start, expected end and tokens before the commit (AC6)."""
+        return views.render(self, "book", body, headers)
+
+    def handle_view_bookings(self, body, headers, path=None):
+        """The customer's own bookings: the code lives here, inside the booking it belongs to (AC7)."""
+        return views.render(self, "bookings", body, headers)
 
     def handle_logs(self, body, headers, path=None):
         """AC3: the telemetry read, and the reason it is safe to answer without a session.
@@ -745,7 +785,10 @@ class Application:
         view = self.booking_view(booking, machine["code"])
         # The booking is the payload, and `booking` is the same object under its key: the response can
         # be read either way — straight off it (the machine, the code, the state) or as the booking.
-        return 201, {**view, "booking": view}
+        # `tokens_required` is the answer's spelling of the tariff (issue #8, AC3, and the redemption
+        # answer of issue #14); `token_count` is the record's (issue #45). One value, so the customer is
+        # told the same number before she commits as the record carries after (issue #20, AC6).
+        return 201, {**view, "booking": view, "tokens_required": view["token_count"]}
 
     def handle_bookings(self, body, headers, path=None):
         """AC5: on the return visit the customer is recognised by the persisted token and reads only
