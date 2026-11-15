@@ -191,6 +191,33 @@ KNOWN_CONTRADICTIONS = {
         "the booking that succeeds on the expiry date — read back in "
         "tests/integration/test_r09_no_show_block_coverage.py. Both files are pinned, so the contradiction "
         "needs a human on which side moves.",
+
+    # Issue #19 (R8): the file the issue supplies is executable in every other respect — the notification read
+    # exists inside the app (`GET /api/notifications`, a pattern, not a ninth contract entry), the pass issues a
+    # new code, the incident vocabulary answers `reassignment` and the notification answers `reassigned`, the
+    # uncoverable turn is cancelled and the day's allowance goes back with it — and each of those is asserted as
+    # an outcome in tests/integration/test_r08_reassignment_coverage.py. What the two scenarios cannot do is
+    # reach them. R5 assigns per machine and never per slot, so the second booking of the first scenario is on
+    # the other machine of the type and the fault is not about it: the pass can only move the records attached to
+    # the machine the report names, and the booking the report was read against stays (issue #11, slice b2, AC3).
+    # The second scenario's comment describes two bookings (10:00 and 10:30) the file itself never makes, so at
+    # the moment of the report the other family machine is free at 11:00 and the turn is covered, not
+    # uncoverable. The supplied file is not modified, so the entry stands until a human corrects one side.
+    ("test_r08_reassignment.py", "test_reassignment_keeps_the_slot_and_issues_a_new_code"):
+        "issue #19: the notification it reads can only exist for a booking the pass can move, and R5 assigns "
+        "per machine, so beth's 10:30 booking is on the second machine of the type, not on the machine anna "
+        "reports — nothing attached to the faulted machine is beth's record. R8 as an outcome — the slot kept, "
+        "the new machine, the new code, the notification naming the new machine on the customer's own read — is "
+        "read back in tests/integration/test_r08_reassignment_coverage.py on the machine the report is about. "
+        "Both files are pinned, so the contradiction needs a human on which side moves.",
+    ("test_r08_reassignment.py", "test_uncoverable_booking_is_cancelled_and_the_turn_can_be_rebooked"):
+        "issue #19: the premise its comment writes is not in the file — nothing is booked at 10:00 or at "
+        "10:30, so the database holds one family booking and the second machine of the type is free at 11:00, "
+        "which covers the turn instead of refusing it. Every fact it names is answered as supplied when the "
+        "type really has nothing free for the slot — the cancellation, the `uncoverable` incident read at the "
+        "seam, the refund as the right to rebook (the day's count goes back with the cancelled turn) — read "
+        "back in tests/integration/test_r08_reassignment_coverage.py. Both files are pinned, so the "
+        "contradiction needs a human on which side moves.",
 }
 
 

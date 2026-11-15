@@ -30,14 +30,28 @@ the device boundary — and no test can be satisfied by moving the other's asser
 outside the seam (this file is asserted in
 `tests/integration/test_maintenance_never_booked_coverage.py`), and it is flagged for the human decision.
 
+The pass itself is deterministic, and determinism is what makes R8 demonstrable (issue #13, AC 9): the
+affected records are processed earliest-start-first with ties broken by the order they were created, and the
+target is the lowest-numbered free machine of the type. Both are decisions here, in one line each, so the
+demo, the test and the reviewer see the same pass and not a coin.
+
 No I/O: `who` is the identity the sign-in resolves to, `booking` is the row, `surface` names the path the
 report arrived on.
 """
+
+from src import machine_states
+from src.repository import parse
+
 
 # The three surfaces a taken fault can arrive on. `CLAIM` is the only one whose residue is narrower than R8.
 DEVICE = "device"
 CLAIM = "claim"
 PANEL = "panel"
+
+# The states a standing customer's record can be in: the code has been spent at the keypad, so the turn has
+# begun. `confirmed` is not one of them — a turn that has not been opened is still a promise, and the claim
+# that admits itself on that promise is the record the claim cannot rewrite.
+STANDING_STATES = ("unlocked", "running")
 
 # The incident a taken report leaves behind, per surface, in one line per surface.
 #
@@ -74,6 +88,47 @@ def entitled_booking(who, bookings) -> dict | None:
     named here, so the same reading is what `may_move` is checked against on the claim surface.
     """
     return next((row for row in bookings if row["email"] == who["email"]), None)
+
+
+def standing_at(booking) -> bool:
+    """The customer already standing at the machine (US40): the code was redeemed at the keypad.
+
+    A turn whose code has been spent is a fact at the machine, not a promise in the app, so the person it
+    belongs to cannot be sent through a support process — there is no staff in this shop. The pass moves her:
+    the machine is released from her turn and the cycle still ahead of the moment the fault is reported goes
+    with the record to the machine the pass names.
+    """
+    return bool(booking["redeemed_at"]) and booking["state"] in STANDING_STATES
+
+
+def pass_order(bookings) -> list:
+    """The order the pass runs in: earliest start first, ties broken by the order the records were created.
+
+    One machine holds one turn that still owes a cycle, so this is the whole of the ordering decision R8
+    needs in order to be testable and demoable, and it is the order the incidents are written in.
+    """
+    return sorted(bookings, key=lambda row: (parse(row["start_time"]), parse(row["created_at"]), row["id"]))
+
+
+def lowest_numbered(machines) -> list:
+    """The target order: the lowest-numbered free machine of the type, so the pass is reproducible."""
+    return sorted(machines, key=lambda row: (number_of(row["code"]), row["code"]))
+
+
+def number_of(code: str) -> int:
+    """The machine number read off the code: `M2` is lower than `M10`, which the code order alone is not."""
+    digits = "".join(character for character in str(code) if character.isdigit())
+    return int(digits) if digits else 0
+
+
+def still_attached(bookings) -> list:
+    """AC5: the records the pass left on the fenced machine, read after every pass on every surface.
+
+    Where R8 runs in full the answer is empty. On the claim surface it is exactly the record the entitlement
+    was read against — the fork recorded above, flagged for the human decision, not a second reading of the
+    rule.
+    """
+    return [str(row["id"]) for row in bookings if row["state"] in machine_states.HOLDING_STATES]
 
 
 def may_move(booking, surface: str, admitted_by: dict | None = None) -> bool:
