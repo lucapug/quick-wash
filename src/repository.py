@@ -54,6 +54,19 @@ TABLES = {
         "end_time TEXT NOT NULL, code TEXT UNIQUE NOT NULL, state TEXT NOT NULL, tokens INTEGER NOT NULL, "
         "redeemed_at TEXT, created_at TEXT NOT NULL",
     ),
+    # R11 (issue #21): the day's allowance as a row per booking that consumes it. The shape is what makes
+    # the limit expressible as a constraint the layer can decide on: a count cannot be a UNIQUE, a seat can
+    # be. `seat` is the ordinal of the booking inside the customer's local day, and `daily_seat` is what
+    # refuses a request whose reading was stale — the same pattern as `bookings_slot` for R5. A row is the
+    # fact the customer's view reads (`used`) and the fact the index decides on, so the rule has one source.
+    # `booking_id` is the record the seat belongs to: the seat goes back with a cancelled turn (R4, US45),
+    # and there is no refund in this product other than the right to rebook.
+    "daily_allowance": (
+        "id INTEGER PRIMARY KEY, email TEXT NOT NULL, day TEXT NOT NULL, seat INTEGER NOT NULL, "
+        "booking_id INTEGER NOT NULL, created_at TEXT NOT NULL",
+        "id SERIAL PRIMARY KEY, email TEXT NOT NULL, day TEXT NOT NULL, seat INTEGER NOT NULL, "
+        "booking_id INTEGER NOT NULL, created_at TEXT NOT NULL",
+    ),
     "no_shows": (
         "id INTEGER PRIMARY KEY, email TEXT NOT NULL, occurred_at TEXT NOT NULL, booking_id INTEGER",
         "id SERIAL PRIMARY KEY, email TEXT NOT NULL, occurred_at TEXT NOT NULL, booking_id INTEGER",
@@ -84,6 +97,10 @@ HOLDING_SQL = ", ".join(f"'{state}'" for state in machine_states.HOLDING_STATES)
 INDEXES = {
     "bookings_slot": f"CREATE UNIQUE INDEX bookings_slot ON bookings (machine_id, start_time) "
                      f"WHERE state IN ({HOLDING_SQL})",
+    # R11 read the same way as R5: the constraint is scoped to the rows that still hold the seat, the seat is
+    # written by the request and decided by the index, and the day is the local shop day as `src/daily_limit.py`
+    # reads it (`Europe/Rome`, reset at 00:00 local).
+    "daily_seat": "CREATE UNIQUE INDEX daily_seat ON daily_allowance (email, day, seat)",
 }
 
 
@@ -184,6 +201,45 @@ class Repository:
             self.db.rollback()
             return None
         return self.db.one("SELECT * FROM bookings WHERE code = ?", (code,))
+
+    def day_seats(self, email: str, day: str) -> list[dict]:
+        """The day's allowance as the layer has it: one row per booking that still consumes a seat.
+
+        A cancelled booking has no row here, because a turn given back gives its seat back (R4, US45, and
+        issue #19 AC3 for the turn the customer lost to a fault). The count this returns is the `used` the
+        customer's view reads and the count the index decides on — one fact, not two readings of it.
+        """
+        return self.db.rows("SELECT * FROM daily_allowance WHERE email = ? AND day = ? ORDER BY seat",
+                            (email, day))
+
+    def take_seat(self, email: str, day: str, seat: int, booking_id: int, at: datetime) -> dict | None:
+        """Insert the day's seat under the UNIQUE index; None means the day was already full (R11).
+
+        This is where R11 is decided, and it is not a pre-check: the seat the request computed came from the
+        snapshot it read when its own request began, so two concurrent requests can name the same seat for
+        the same day, and this insert is what refuses one of them — the `daily_seat` index on PostgreSQL, the
+        write conflict on the same seat on the file-backed fallback. The refusal writes nothing: the caller's
+        transaction is rolled back, so the loser leaves neither a seat nor a booking behind.
+        """
+        try:
+            self.db.execute(
+                "INSERT INTO daily_allowance (email, day, seat, booking_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                (email, day, seat, booking_id, iso(at)),
+            )
+        except Exception:
+            self.db.rollback()
+            return None
+        return self.db.one("SELECT * FROM daily_allowance WHERE email = ? AND day = ? AND seat = ?",
+                           (email, day, seat))
+
+    def release_seat(self, booking_id: int) -> None:
+        """The seat goes back with the turn (R4, US45): a cancelled booking does not consume the day.
+
+        Only a cancellation reaches this line. A turn lost to a no-show is not a turn given back, so the row
+        stays — the customer consumed the allowance for a turn she did not honour, which is the fact R11 and
+        R9 count differently and the reason the two rules are not the same rule.
+        """
+        self.db.execute("DELETE FROM daily_allowance WHERE booking_id = ?", (booking_id,))
 
     def booking_by_code(self, code: str) -> dict | None:
         """The booking one numeric code is tied to. The code is the only way a booking is read at the keypad."""

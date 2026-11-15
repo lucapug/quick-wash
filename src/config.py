@@ -33,6 +33,10 @@ SEED = {
     "no_show_threshold": 2,
     "block_days": 7,
     "bookings_per_day": 2,
+    # R11 (issue #21): "per day" is the local shop day, not the UTC one, and the number is held here like
+    # every other number in this project so it can be read back over HTTP. The shop runs on local hours
+    # (07:00-22:00, closed Sunday); a UTC day would reset in the middle of a shop evening.
+    "timezone": "Europe/Rome",
     "owner_email": "owner@quickwash.local",
     "otp_displayed_in_app": True,
     # AC4: the one-time code is single-use and lives 10 minutes. Held as a number here, like every

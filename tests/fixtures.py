@@ -192,6 +192,56 @@ KNOWN_CONTRADICTIONS = {
         "tests/integration/test_r09_no_show_block_coverage.py. Both files are pinned, so the contradiction "
         "needs a human on which side moves.",
 
+    # Issue #21 (R11): the file the issue supplies is executable in every other respect — the limit, the "
+    # count used and the reset moment on the refusal, and the same three on the customer's own view before "
+    # any refusal — and each of those is asserted as an outcome in "
+    # tests/integration/test_r11_daily_limit_coverage.py. What the two scenarios cannot do is reach them.
+    # The first scenario's first request is 08:00 with the clock at 09:00, the slot that has already begun "
+    # (issue #45, AC3), so the day it counts cannot be built from inside the file: that request is refused "
+    # as 422 and no booking is created for it. The second scenario's last request needs a machine, and by "
+    # the time it arrives both quick machines of the pack (2, tests/conftest.py) hold a turn: a machine held "
+    # for the customer who booked it is never free for another point, the reading issue #8 pins in "
+    # tests/integration/test_availability_public_view.py, so the request after the reset is refused for the "
+    # machine and not for the limit — at 00:01 on 10 November the count is 0, exactly as the file asserts, "
+    # and the shop has nothing to give. The supplied file is not modified, so the entries stand until a "
+    # human corrects one side.
+    ("test_r11_daily_limit.py", "test_two_bookings_per_day_independent_of_overlap"):
+        "issue #21 (R11): the file's first request is 08:00 with the clock at 09:00, the slot that has "
+        "already begun (issue #45, AC3, pinned by tests/integration/test_booking_creation_happy_path.py), so "
+        "it answers 422 and the two bookings the day is counted on cannot be created from inside the file. "
+        "Every criterion it names is answered as supplied on slots the shop can still take — the limit, the "
+        "count used, the reset moment in the refusal, the same three on the customer's own view before any "
+        "refusal, and the count read on the day the record was written — read back in "
+        "tests/integration/test_r11_daily_limit_coverage.py. Both files are pinned, so the contradiction "
+        "needs a human on which side moves.",
+    ("test_r11_daily_limit.py", "test_reset_happens_at_midnight_local_and_cancelled_bookings_do_not_count"):
+        "issue #21 (R11): the two facts it names are answered as outcomes (the cancelled turn gives its seat "
+        "back, and the count goes back at 00:00 local in Europe/Rome), but the file cannot reach the last "
+        "assertion: its two 20:00 bookings commit both quick machines of the pack, and a machine held for "
+        "the customer who booked it is never free for another point — the reading issue #8 pins in "
+        "tests/integration/test_availability_public_view.py (count == 1 after one booking of the type) — so "
+        "at 00:01 on 10 November the seam answers no_machine_free, not the limit, because on that day her "
+        "count is already 0. Read back as outcomes in tests/integration/test_r11_daily_limit_coverage.py, on "
+        "a type that still has a machine free. Both files are pinned, so the contradiction needs a human on "
+        "which side moves.",
+
+    # The same shape on the loser's answer. Issue #48 (slice c) pins, through its coverage file, that a "
+    # refusal names only slots the customer can actually take — and the assertion in this file is that the "
+    # answer is not empty. On the pack's two quick machines the whole type is committed for the slot the "
+    # refusal is about (one held by the booking this test makes first, one by the request that won the "
+    # race), so the single predicate `src/alternatives.py` answers on — `availability.free_at`, the same one "
+    # the public window answers on — names nothing, and an empty set is the only honest answer. The test "
+    # passes only when the loser's answer is read on the snapshot its own request took, before the winner "
+    # committed: that is not a guarantee, and it is not what the loser is promised. The fact is read back on "
+    # a pack big enough for it in tests/integration/test_refusal_alternatives_ux_coverage.py. Both files are "
+    # pinned, so the entry stands until a human decides which side moves.
+    ("test_r05_no_overbooking_coverage.py",
+     "test_the_refusal_is_the_persistence_layer_s_whenever_one_machine_can_hold_the_slot"):
+        "issue #48 (slice c): the loser's alternatives are the slots she can actually take, and with the "
+        "pack's two quick machines both are committed for the slot the refusal is about, so no slot can be "
+        "named; the assertion holds only while the loser's read lands on its own stale snapshot, which the "
+        "layer does not promise. Recorded rather than bent.",
+
     # Issue #19 (R8): the file the issue supplies is executable in every other respect — the notification read
     # exists inside the app (`GET /api/notifications`, a pattern, not a ninth contract entry), the pass issues a
     # new code, the incident vocabulary answers `reassignment` and the notification answers `reassigned`, the
