@@ -64,6 +64,16 @@ TABLES = {
         "id SERIAL PRIMARY KEY, kind TEXT NOT NULL, email TEXT, machine_id INTEGER, booking_id INTEGER, "
         "created_at TEXT NOT NULL, detail TEXT NOT NULL",
     ),
+    # The notification is the app's own record (docs/spec.md, Out of Scope: no email, no SMS, no push). There
+    # is no transport table to write it to: the row is the whole of it, read back by the customer the booking
+    # belongs to. `kind` is stored in the incident vocabulary and read in the app's words through
+    # `src/notifications.py`, so the fact is written once and the two spellings cannot drift.
+    "notifications": (
+        "id INTEGER PRIMARY KEY, email TEXT NOT NULL, kind TEXT NOT NULL, booking_id INTEGER, "
+        "machine_id INTEGER, created_at TEXT NOT NULL, message TEXT NOT NULL",
+        "id SERIAL PRIMARY KEY, email TEXT NOT NULL, kind TEXT NOT NULL, booking_id INTEGER, "
+        "machine_id INTEGER, created_at TEXT NOT NULL, message TEXT NOT NULL",
+    ),
 }
 
 # R5 read together with R4: the slot is unique among the bookings that still hold a turn. Written as an
@@ -298,6 +308,22 @@ class Repository:
 
     def incidents(self) -> list[dict]:
         return self.db.rows("SELECT * FROM incidents ORDER BY id")
+
+    def record_notification(self, kind: str, now: datetime, message: str, email: str,
+                            booking_id: int, machine_id: int) -> dict:
+        """The notification the app will show. Written once per fact, and delivered nowhere."""
+        self.db.execute(
+            "INSERT INTO notifications (email, kind, booking_id, machine_id, created_at, message) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (email, kind, booking_id, machine_id, iso(now), message))
+        return self.db.one("SELECT * FROM notifications ORDER BY id DESC")
+
+    def notifications_for(self, email: str) -> list[dict]:
+        """The customer's own notifications, in the order they arrived — the shape the read answers with.
+
+        Filtered by the identity, exactly as the customer's booking list is: there is no notification a
+        customer may read that is not hers, and no notification that leaves the app.
+        """
+        return self.db.rows("SELECT * FROM notifications WHERE email = ? ORDER BY id", (email,))
 
     def next_code(self, now: datetime) -> str:
         """The booking's numeric code: six digits, one per booking, never the shape a typo reads as.

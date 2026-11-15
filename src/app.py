@@ -111,11 +111,28 @@ so the customer can rebook at once (US39). A claim that arrives while the window
 restarts it (US35) — the state stands, so no hop is attempted and the table declares no self-entry for
 `cleaning_required`. Its entitlement is narrower than R7's: the customer currently assigned to the machine
 (issue #12, AC6), the repeat being read against the record the first claim left on it.
+
+R8 (issue #19) is the pass `apply_fault` runs: the bookings attached to a machine that goes to `maintenance`
+move to a free machine of the same type, earliest start first with ties broken by the order the records were
+created, the target being the lowest-numbered free machine of the type — both are decisions in
+`src/faults.py`, in one line each, so the reviewer's demo and the test see the same pass. The booking keeps
+its start, gets a new code, and the pass writes the notification the customer reads inside the app: there is
+no email, no SMS, no push, so `GET /api/notifications` (a pattern, not a ninth contract entry) is the only
+delivery channel and it answers a customer's own notifications to that customer. A turn nothing of the type
+can cover is cancelled and the refund is the right to rebook — no money, no ledger, so the day's allowance
+goes back with the cancelled record and the customer can take a slot at once. The invariant R8 closes is read
+after every pass, on every surface, and the answer carries what it found: on the device boundary and on the
+panel nothing is left attached, on the claim surface the machine keeps exactly the record the entitlement was
+read against (the fork `src/faults.py` records for the human decision). A customer already standing at the
+machine is moved immediately rather than sent through a support process, because there is no staff to ask:
+when the code was already redeemed the machine is released from her turn and the cycle still ahead moves with
+the record.
 """
 
 from datetime import datetime, timedelta
 
 from src import alternatives, availability, cancellation, domain, entitlements, faults, machine_states, rules
+from src import notifications
 from src import identity as credentials
 from src.clock import Clock
 from src.domain import counters
@@ -163,7 +180,13 @@ SPENT_STATES = ("unlocked", "running", "finished")
 # `ROUTES` stays the eight entries tests/test_seam.py pins. It needs a session, because a caller with no
 # identity has no counter to read.
 PATTERNS = {"POST /api/session/verify": "verify", "GET /api/logs/recent": "logs",
-           "GET /api/customers/me": "customer_me"}
+           "GET /api/customers/me": "customer_me",
+           # The notification read (issue #19, R8) is the fifth pattern for the same reason: the contract
+           # fixes the eight entries tests/conftest.py pins, and the app's own notification is a read of what
+           # the pass wrote, not a ninth entry. It is entitlement-gated like the booking surface — a caller
+           # with no session has no notifications to read — and it is the only delivery channel there is,
+           # because notifications outside the app (email, SMS, push) are out of scope.
+           "GET /api/notifications": "notifications"}
 
 # The booking surface of one booking (issue #10, slice a): the read of a booking and its cancellation.
 # Patterns, not contract paths, so `ROUTES` stays exactly the eight entries tests/test_seam.py pins —
@@ -558,8 +581,13 @@ class Application:
         return availability.free_at(machine, start, self.config, availability.taken_turns(self.repo, [machine]))
 
     def pick_machine(self, type_key: str, start) -> dict | None:
-        """First machine of the type that can actually be assigned for `start`."""
-        for machine in self.repo.candidate_machines(type_key):
+        """First machine of the type that can actually be assigned for `start`.
+
+        `faults.lowest_numbered` is the order R8 needs to be demonstrable (issue #13, AC 9): the target of a
+        reassignment is the lowest-numbered free machine of the type, so the same fault on the same state
+        answers with the same machine in the demo, in the test and on the panel.
+        """
+        for machine in faults.lowest_numbered(self.repo.candidate_machines(type_key)):
             if self.is_assignable(machine, start):
                 return machine
         return None
@@ -750,11 +778,43 @@ class Application:
             "message": block["message"],
         }
 
+    def notify(self, kind, booking, machine, now, code: str | None = None) -> dict:
+        """The notification, written once for the fact the pass wrote and delivered nowhere.
+
+        The app is the only channel (docs/spec.md, Out of Scope: no email, no SMS, no push), so a notification
+        is a row the customer reads back on her own read. It names the machine the customer has to walk to
+        (US38) — the one the pass chose, never the one the report was about.
+        """
+        row = self.repo.record_notification(kind, now, notifications.message(kind, machine["code"], code),
+                                            booking["email"], booking["id"], machine["id"])
+        return row
+
+    def handle_notifications(self, body, headers, path=None):
+        """The customer's own notifications, inside the app.
+
+        The gate is the one the booking surface uses: 401 for a caller with no session, because a caller with
+        no identity has no notification to read. The list is filtered by the identity the token resolves to,
+        the way the customer's booking list is — a notification belongs to the customer the booking belongs to.
+        The `kind` is read in the app's words (`reassigned`), which is the same fact the incident list carries
+        as `reassignment`; the mapping is `src/notifications.py`, in one place.
+        """
+        who = self.customer(headers)
+        if who is None:
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        rows = []
+        for row in self.repo.notifications_for(who["email"]):
+            machine = self.repo.machine_by_id(row["machine_id"])
+            rows.append(notifications.view(row, machine["code"] if machine else None))
+        return 200, rows
+
     def daily_limit(self, who, day) -> dict:
         """R11 as the customer reads it (US48): the limit, what is used, what is left, when it resets.
 
         In one place, so the customer's list and the customer's view cannot disagree about the same day.
-        Cancelled bookings do not count, which is what makes US45 true on the read as well as on the write.
+        Cancelled bookings do not count, which is what makes US45 true on the read as well as on the write,
+        and what makes R8's refund real: an uncoverable cancellation does not consume the allowance (issue
+        #19, AC3) — there is no money in this product, so the refund is the right to rebook, and a turn the
+        customer lost to a fault she did not cause cannot be the turn that blocks her.
         """
         used = len([row for row in self.repo.bookings_for(who["email"])
                     if parse(row["start_time"]).date() == day and row["state"] != "cancelled"])
@@ -1227,6 +1287,15 @@ class Application:
         the reviewer reads is the same fact the gate was answered with. This is also the single code path the
         deterministic trigger of issue #24 uses: the trigger is a request on one of these surfaces, so the demo
         and the test exercise one implementation.
+
+        The pass itself (issue #19): the records are read in the order `faults.pass_order` gives them —
+        earliest start first, ties by the order they were created — and each turn still owed is moved to the
+        lowest-numbered free machine of the type with a new code and a notification for the customer the
+        booking belongs to. A turn already run is a fact, not a turn to move; a turn the customer is standing
+        in is moved immediately, and the cycle still ahead of the moment the report arrives goes with the
+        record. What nothing of the type can cover is cancelled, the incident is `uncoverable`, and the day's
+        allowance goes back with the record because the refund is the right to rebook. The invariant is checked
+        after the pass on every surface and the answer carries what it found.
         """
         self.transition(machine["id"], "maintenance", now)
         held = self.repo.bookings_on_machine(machine["id"])
@@ -1236,9 +1305,15 @@ class Application:
                                              who["email"], machine["id"], record["id"] if record else None)
                     if kind else None)
         reassigned, cancelled, kept = [], [], []
-        for booking in held:
+        for booking in faults.pass_order(held):
+            # AC1: earliest start first, ties broken by the order the records were created.
+            if booking["state"] in machine_states.BOOKING_TERMINAL_STATES:
+                continue
             start = parse(booking["start_time"])
-            if start <= now or booking["state"] in ("expired", "cancelled", "closed"):
+            standing = faults.standing_at(booking)
+            # A turn the machine has already run is not a turn to move; a turn the customer is standing in is
+            # hers to move immediately (US40), because there is no staff to ask.
+            if start <= now and not standing:
                 continue
             if not faults.may_move(booking, surface, record):
                 # AC3: the claim keeps the record it is read against, so the machine keeps exactly it.
@@ -1247,22 +1322,37 @@ class Application:
             tariff = domain.tariff_of(machine["type"], self.config)
             replacement = self.pick_machine(machine["type"], start)
             if replacement is None:
+                # US39: told honestly, and the turn is given back — the refund is the right to rebook, so the
+                # day's count goes back with the booking and she can take a slot at once.
                 self.repo.set_booking_state(booking["id"], "cancelled")
                 cancelled.append(booking["code"])
                 self.repo.record_incident("uncoverable", now, "no machine of the type free, turn refunded",
                                           booking["email"], machine["id"], booking["id"])
+                self.notify("cancellation", booking, machine, now)
                 continue
             new_code = self.repo.next_code(now)
             self.db.execute("UPDATE bookings SET machine_id = ?, code = ? WHERE id = ?",
                             (replacement["id"], new_code, booking["id"]))
             self.assign(replacement, now)
-            reassigned.append({"booking": booking["id"], "machine": replacement["code"], "code": new_code,
-                               "start": hhmm(start), "tokens": tariff.tokens_required})
+            entry = {"booking": str(booking["id"]), "machine": replacement["code"], "code": new_code,
+                     "start": hhmm(start), "tokens": tariff.tokens_required}
+            if standing:
+                # US40: the machine she was standing at is released from her turn and the cycle still ahead of
+                # the moment the fault was reported goes with the record. The start on the record stays.
+                entry["standing"] = True
+                entry["remaining_minutes"] = int((parse(booking["end_time"]) - now).total_seconds() // 60)
+            reassigned.append(entry)
             self.repo.record_incident("reassignment", now, f"moved off {machine['code']}",
                                       booking["email"], replacement["id"], booking["id"])
+            self.notify("reassignment", booking, replacement, now, new_code)
+        # AC5: the invariant is checked after every pass, on every surface, and the answer carries what it
+        # found. Where R8 runs in full it finds nothing; on the claim surface it names exactly the record the
+        # entitlement was read against — the fork `src/faults.py` records for the human decision.
+        attached = faults.still_attached(self.repo.bookings_on_machine(machine["id"]))
         return entitlements.ALLOWED, {"outcome": "maintenance", "machine": machine["code"],
                                       "incident": incident["kind"] if incident else None,
                                       "reassigned": reassigned, "cancelled": cancelled, "kept": kept,
+                                      "attached": attached,
                                       "message": "Macchina messa fuori servizio"}
 
     def handle_occupied(self, body, headers, now, path=None):
@@ -1325,8 +1415,8 @@ class Application:
                                       who["email"], machine["id"], booking["id"])
             outcome["reassigned"] = None
             outcome["cancelled"] = booking["code"]
-            outcome["notification"] = {"kind": "cancellation", "booking": str(booking["id"]),
-                                       "message": "Nessuna macchina libera dello stesso tipo: turno rimborsato"}
+            row = self.notify("cancellation", booking, machine, now)
+            outcome["notification"] = notifications.view(row, machine["code"], notifications.INCIDENT)
             outcome["message"] = "Macchina in pulizia: nessuna macchina libera, turno rimborsato"
             return entitlements.ALLOWED, outcome
 
@@ -1339,10 +1429,10 @@ class Application:
         outcome["reassigned"] = {"booking": str(booking["id"]), "machine": replacement["code"],
                                  "code": new_code, "start": hhmm(start)}
         # US38: the notification carries the new machine number, because the customer would otherwise walk
-        # to the machine the report was about.
-        outcome["notification"] = {"kind": "reassignment", "booking": str(booking["id"]),
-                                   "machine": replacement["code"],
-                                   "message": f"Sei spostato su {replacement['code']}: nuovo codice {new_code}"}
+        # to the machine the report was about. The row is the fact the app shows on her own read; the answer
+        # carries the same fact in the incident word the report answers with.
+        row = self.notify("reassignment", booking, replacement, now, new_code)
+        outcome["notification"] = notifications.view(row, replacement["code"], notifications.INCIDENT)
         outcome["message"] = "Macchina in pulizia: sei stato spostato subito"
         return entitlements.ALLOWED, outcome
 
@@ -1537,9 +1627,15 @@ class Application:
                 for row in self.repo.incidents()]
 
     def incident_view(self, row, observer: bool = False) -> dict:
-        """An incident carries the machine it happened on as the reviewer reads it: the machine code."""
+        """An incident carries the machine it happened on as the reviewer reads it: the machine code.
+
+        `booking` is the record the incident is about, in the spelling the read of the incident answers with;
+        `booking_id` stays the spelling the owner's surface was pinned on. The same record, never two values
+        for it, and no customer and no code on the observer's read (US22, US42).
+        """
         machine = self.repo.machine_by_id(row["machine_id"]) if row["machine_id"] else None
         view = {"id": row["id"], "kind": row["kind"], "machine": machine["code"] if machine else None,
+                "booking": str(row["booking_id"]) if row["booking_id"] is not None else None,
                 "detail": row["detail"], "created_at": row["created_at"]}
         if not observer:
             view["email"] = row["email"]
