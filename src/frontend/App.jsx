@@ -6,6 +6,7 @@
 // backend-for-frontend layer between the shell and the tested seam, so the shell cannot re-decide a rule:
 // it displays what the seam decided, in the language the seam answered in.
 
+import React from "react";
 import { useEffect, useState } from "react";
 
 const SEAM = {
@@ -94,6 +95,13 @@ export default function App() {
   }
 
   const view = parse(page ? page.body : null);
+
+  // Verdict fix (manual, needs-human path): while the view state is still null — the fetch inside the
+  // effect has not answered yet — the component renders the loading shell, never a page built from a
+  // state that is only a screen name. `parse` runs only on fetched text.
+  if (!page) {
+    return <main className="container py-4" data-screen={FIRST_SCREEN}><p>Loading availability…</p></main>;
+  }
 
   return (
     <main className="container py-4" data-screen={page ? page.screen : null} onClick={act}>

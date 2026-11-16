@@ -3,7 +3,9 @@
 The system's database is PostgreSQL, declared in `docker-compose.yml` and reached through
 `QW_DATABASE_URL` (the CI service and `docker compose up` both set it). A clean checkout with no
 network egress has no reachable PostgreSQL, so the adapter falls back to a file-backed SQLite
-database. Both are real relational databases and the repository code above them is identical — the
+database. The variable can name that file directly (`QW_DATABASE_URL=sqlite:///<path>`), which is what a run
+from a clean checkout uses: the entry point has nothing else to be told which database to open (issue #69).
+Both are real relational databases and the repository code above them is identical — the
 repository is never mocked, which is what makes the R5 race a persistence-layer fact rather
 than a pre-check.
 
@@ -49,6 +51,22 @@ def default_url() -> str:
     return os.environ.get("QW_DATABASE_URL", DEFAULT_URL)
 
 
+def sqlite_target(url: str) -> str | None:
+    """The file a `sqlite://` value names: `sqlite:///path`, `sqlite:./path`, or a plain path.
+
+    The entry point has one way to be told which database to open — `QW_DATABASE_URL` — so the fallback has to
+    be reachable through it, not only through the `path` argument. The URL is the same decision as the path:
+    the file the sqlite backend opens, written the way every path in this project is written.
+    """
+    if url.startswith("sqlite:///"):
+        return url[len("sqlite:///"):] or None
+    if url.startswith("sqlite:"):
+        return url[len("sqlite:"):] or None
+    if "://" not in url and not url.startswith("postgres"):
+        return url or None
+    return None
+
+
 def connect(url: str | None = None, path: str | None = None) -> "Database":
     """Connect to PostgreSQL when it is reachable, otherwise to the file-backed fallback."""
     url = url or default_url()
@@ -67,6 +85,7 @@ def connect(url: str | None = None, path: str | None = None) -> "Database":
                 probe.close()
                 return Database(lambda: psycopg.connect(url, connect_timeout=3), POSTGRES, url)
 
+    path = path or sqlite_target(url)
     if path is None:
         raise ValueError("the sqlite backend needs a file path")
     return Database(lambda: sqlite_connection(path), SQLITE, path)
