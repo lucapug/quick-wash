@@ -235,6 +235,18 @@ KNOWN_CONTRADICTIONS = {
     # committed: that is not a guarantee, and it is not what the loser is promised. The fact is read back on "
     # a pack big enough for it in tests/integration/test_refusal_alternatives_ux_coverage.py. Both files are "
     # pinned, so the entry stands until a human decides which side moves.
+    # The deployment-doc issue (the tier-1 half of the Deployment criterion) delivers a modular doc under
+    # docs/, and the file issue #1 supplies pins the docs set to the four files the root index lists: the
+    # pack, the record, the team spec and the tracker. A fifth file cannot exist without contradicting the
+    # supplied assertion, so the contradiction is recorded rather than resolved by editing it: the supplied
+    # file runs as given, and the document is asserted as written in tests/test_deployment_doc.py. When a
+    # human adds the deployment doc to the set issue #1 names, this entry has to be removed.
+    ("test_context_files.py",
+     "test_docs_folder_contains_only_the_pack_the_record_the_team_spec_and_the_tracker"):
+        "the deployment-doc issue: docs/deployment.md, a modular doc the AGENTS.md index must list, while "
+        "the supplied file pins the docs set to exactly the four files issue #1 wrote. Both are pinned, so "
+        "the contradiction needs a human on which side moves.",
+
     ("test_r05_no_overbooking_coverage.py",
      "test_the_refusal_is_the_persistence_layer_s_whenever_one_machine_can_hold_the_slot"):
         "issue #48 (slice c): the loser's alternatives are the slots she can actually take, and with the "
