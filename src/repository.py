@@ -127,16 +127,36 @@ class Repository:
         self.seed()
 
     def seed(self) -> None:
+        """The seed inventory, written once and written the same way twice (issue #24, AC3 and AC6).
+
+        Two things make it a seed rather than a fixture: the numbers come from `src/config.py` and nothing
+        else, and the write is idempotent — a key that is already there is not written again, and a machine
+        whose code is already there is not inserted again. The codes are the counter the same loop gives
+        them, in the order the types are listed, so the second run names the same eight machines and adds
+        nothing: `M1`-`M4` standard, `M5`-`M6` family, `M7`-`M8` quick. That is what lets the reviewer run
+        the seed twice on the same database, which is the normal thing to happen on a second start of the
+        container, without the inventory drifting or doubling.
+
+        Nothing here is random and nothing here is a fixture invented in code: the inventory is the pack's
+        (`tests/conftest.py`, and `tests/test_seam.py` asserts it through the seam).
+        """
+        already = {row["key"] for row in self.db.rows("SELECT key FROM settings")}
         for key, value in self.seed_config.items():
+            if key in already:
+                continue
             self.db.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+        present = {row["code"] for row in self.db.rows("SELECT code FROM machines")}
         counter = 0
         now = iso(datetime.now())
         for type_key, count in self.seed_config["types"].items():
             for _ in range(count):
                 counter += 1
+                code = f"M{counter}"
+                if code in present:
+                    continue
                 self.db.execute(
                     "INSERT INTO machines (code, type, state, changed_at) VALUES (?, ?, ?, ?)",
-                    (f"M{counter}", type_key, "available", now),
+                    (code, type_key, "available", now),
                 )
 
     def settings(self) -> dict:

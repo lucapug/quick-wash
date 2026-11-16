@@ -35,6 +35,12 @@ affected records are processed earliest-start-first with ties broken by the orde
 target is the lowest-numbered free machine of the type. Both are decisions here, in one line each, so the
 demo, the test and the reviewer see the same pass and not a coin.
 
+Issue #24's trigger arrives on the claim surface with no record to read the entitlement against, so
+`admitted_by` is None, `may_move` answers yes for every booking and `incident_kind` answers `fault`: the
+demo, the reviewer's commands and the test run this same core, not a copy of it. `STANDING` is the one line
+that keeps a second trigger from writing a hop the table does not declare — the state stands, the incident is
+the second fact, and the same call on the same machine gives the same result twice.
+
 No I/O: `who` is the identity the sign-in resolves to, `booking` is the row, `surface` names the path the
 report arrived on.
 """
@@ -47,6 +53,14 @@ from src.repository import parse
 DEVICE = "device"
 CLAIM = "claim"
 PANEL = "panel"
+
+# The state a second trigger finds the machine in, and the reason it writes no hop: `TRANSITIONS` declares
+# no self-entry for `maintenance`, so the seam does not invent one — the state stands, exactly as the
+# repeat still-occupied claim stands for the cleaning window (`machine_states.REPEAT_REPORT`, US35). What the
+# second trigger still writes is its own incident, because a second call is a second decision, and that is
+# what makes the demo reproducible rather than a coin flip (issue #24, AC1: "the same machine, the same
+# trigger, the same result"). Determinism lives here, in one line, not in the handler.
+STANDING = "maintenance"
 
 # The states a standing customer's record can be in: the code has been spent at the keypad, so the turn has
 # begun. `confirmed` is not one of them — a turn that has not been opened is still a promise, and the claim

@@ -149,6 +149,18 @@ literally the right to rebook, and the customer's own view (`GET /api/customers/
 the 409 that answers her third attempt read the same shape from the same rows — the limit, the count used, the
 moment it resets — before any refusal happens. The order is the rule's: the R9 gate answers before the
 allowance is read, so a blocked customer is refused for the block and the answer never also names the limit.
+
+Issue #24 is the deterministic trigger: the switch (`src/config.py`, default empty) read at startup, plus the
+panel action `POST /api/owner/faults/trigger`. Both reach the machine through `apply_report`, the function the
+claim surface runs, so there is no fourth core and `apply_fault` stays the single writer of the hop into
+`maintenance`; the incident is the `fault` the report path records, and the pass that follows is the R8 pass.
+The machine the request names is read through `machine_named`, the one resolution the panel and the public
+per-machine read share, so `3` and `M3` are the same machine and the reviewer can trigger one and read that
+one. A trigger that lands on a machine already in `maintenance` writes no hop — the table declares no
+self-entry, so the state stands and the incident is the second fact — which is what lets the same call on the
+same machine give the same result twice, the thing a demo needs and the thing "no randomness" means. On the
+trigger path the gate is the panel's decision for a person and the switch itself for a caller with no session,
+because AC5 asks the reviewer to reproduce the chain with the start and one call and nothing between them.
 """
 
 from datetime import datetime, timedelta
@@ -246,6 +258,12 @@ OWNER_PANEL = "/api/owner/"
 OWNER_READS = ("status-board", "machines", "incidents")
 OWNER_RESOURCES = ("machines", "bookings")
 OWNER_WRITES = ("maintenance", "cancel")
+# Issue #24 (open decision 1, accepted as signed): the deterministic trigger, the panel surface the demo
+# needs. A pattern, not a ninth contract path, so `ROUTES` stays the eight entries tests/conftest.py pins.
+# It is the only panel surface a caller with no session can reach, and that is recorded in `trigger_gate`:
+# AC5 asks for two commands, the start and one trigger call, with nothing between them.
+OWNER_TRIGGERS = ("faults",)
+TRIGGER_WRITE = "trigger"
 # US54 asks for both directions of the toggle. `maintenance` is reached through the table, `available`
 # is the declared hop back out, so the toggle never writes a hop the table does not declare.
 TOGGLE_STATES = ("maintenance", "available")
@@ -273,6 +291,13 @@ class Application:
         self.config = self.repo.settings()
         self.telemetry = Telemetry(clock=self.clock)
         self.journey = None  # the journey the request being handled belongs to (shared trace id)
+        # Issue #24, AC1: the switch is read at startup, and its default is empty — a normal run seeds an
+        # inventory with nothing broken. When it names a machine, that machine is out of use before the first
+        # request, and it got there on the same call the demo and the test make: `apply_fault`, the single
+        # writer of the hop, on the claim surface, for the identity the switch has (none). Nothing here
+        # decides a fault: the decision is the configuration, the path is the report's.
+        self.fault_trigger = str(self.config.get("fault_trigger_machine", ""))
+        self.apply_startup_trigger()
 
     # --- seam ---------------------------------------------------------------
 
@@ -318,6 +343,22 @@ class Application:
             # of the handler and the journey. Never the body, which is where a credential arrives (AC3).
             self.telemetry.record(method, path, status, event=name, journey=self.journey)
             return status, payload
+
+    def apply_startup_trigger(self) -> dict | None:
+        """The switch, applied once at startup, through the same core a report uses.
+
+        Empty is the default and the whole of a normal run: no machine is out of use, no incident is written.
+        A code or a number names one machine, and the hop it takes is the hop the table declares for it.
+        `apply_fault` is the only writer of that hop, so the startup path and the demo path cannot drift into
+        two readings of R7 — this is what open decision 1 asks for, a fault that exists in the running system
+        and not only inside an integration test.
+        """
+        if not self.fault_trigger:
+            return None
+        machine = self.machine_named(self.fault_trigger)
+        if machine is None:
+            return None
+        return self.apply_fault(dict(OBSERVER), machine, self.clock.now(), faults.CLAIM)[1]
 
     def pattern_route(self, method: str, path: str) -> str | None:
         """The reads that are patterns, not contract paths: one machine (AC 8), the code, the logs,
@@ -367,6 +408,10 @@ class Application:
             return tail[0], None
         if method == "POST" and len(tail) == 3 and tail[0] in OWNER_RESOURCES and tail[2] in OWNER_WRITES:
             return tail[2], tail[1]
+        # The trigger names nothing in the URL: the machine it puts out of use is the one the request
+        # carries, resolved by the same `machine_named` the per-machine read answers on.
+        if method == "POST" and len(tail) == 2 and tail[0] in OWNER_TRIGGERS and tail[1] == TRIGGER_WRITE:
+            return TRIGGER_WRITE, None
         return None
 
     def resolve_buffers(self, now) -> None:
@@ -1375,7 +1420,12 @@ class Application:
         allowance goes back with the record because the refund is the right to rebook. The invariant is checked
         after the pass on every surface and the answer carries what it found.
         """
-        self.transition(machine["id"], "maintenance", now)
+        # A machine already out of service is not put out of service twice: the table declares no self-entry
+        # for `maintenance`, so the seam writes no hop and the state stands (`faults.STANDING`, the same
+        # reading as the repeat cleaning claim). The incident is still written, because the second call is a
+        # second decision — which is what the reviewer's demo needs to be runnable twice (issue #24, AC1).
+        if machine["state"] != faults.STANDING:
+            self.transition(machine["id"], "maintenance", now)
         held = self.repo.bookings_on_machine(machine["id"])
         record = faults.entitled_booking(who, held)
         kind = faults.incident_kind(surface)
@@ -1555,16 +1605,58 @@ class Application:
             return entitlements.ALLOWED, None
         return entitlements.NOT_ENTITLED, entitlements.panel_refusal()
 
+    def trigger_gate(self, headers) -> tuple[int, dict | None]:
+        """The trigger's entitlement: the owner, or the switch itself when there is no identity.
+
+        The panel doctrine is untouched for every caller that *is* a person: a session that is not the owner
+        is refused here exactly as on every other panel surface, with the same decision
+        (`entitlements.may_enter_panel`) and the same body. The one asymmetry is the caller with no session.
+        Issue #24, AC5 asks the reviewer to reproduce the whole chain with two commands — `docker compose up`
+        and one fault-trigger call — so there is no sign-in between them, and the entitlement that caller has
+        is the configuration switch: nothing is random, nothing is a test-only hook, and the fault exists in
+        the running system. A trigger call that arrives with a session is a person and is refused like one.
+        Recorded here, in the place the decision lives, so the gate can be read as one fact rather than as a
+        convenience: `tests/integration/test_owner_panel_surfaces.py` pins 401 for no session on every panel
+        surface it names, and the trigger is not one of them — it is the demo action.
+        """
+        who = self.who_is_asking(headers)
+        if who is not None and not who.get("is_observer"):
+            # A caller that presented a session is a person, and the panel decides for a person the same way
+            # on every surface: the decision is `entitlements.may_enter_panel`, the body is the same body.
+            if entitlements.may_enter_panel(who):
+                return entitlements.ALLOWED, None
+            return entitlements.NOT_ENTITLED, entitlements.panel_refusal()
+        if (headers or {}).get("Authorization"):
+            # A token that does not resolve is not an identity and not the reviewer: it is the absence of a
+            # session, and it is answered as the panel answers it.
+            return entitlements.MISSING_SESSION, entitlements.missing_session()
+        return entitlements.ALLOWED, None
+
     def panel_named(self, path) -> str | None:
         """What a panel write names: the machine or the booking carried by the URL segment."""
         return self.owner_surface("POST", path)[1]
 
-    def panel_machine(self, named) -> dict | None:
-        """The machine the panel request names: the code as written, or the id the segment reads as."""
+    def machine_named(self, named) -> dict | None:
+        """The machine a request names: the code as written, the code as the board spells it, or the number.
+
+        One resolution, so the public per-machine read and the panel read cannot name two different machines
+        for the same string. The number is the machine's own `id`, the thing the board carries, and the seed
+        numbers its eight machines in the order `src/config.py` lists the types, so `3` and `M3` are the same
+        machine — which is what makes the reviewer's trigger call and the reviewer's read of that machine
+        speak about one object (issue #24).
+        """
         if not named:
             return None
-        found = self.repo.machine(named) or self.repo.machine(named.upper())
-        return found or self.repo.machine_by_id(int(named) if named.isdigit() else None)
+        text = str(named).strip()
+        found = self.repo.machine(text) or self.repo.machine(text.upper())
+        if found is not None:
+            return found
+        digits = "".join(character for character in text if character.isdigit())
+        return self.repo.machine_by_id(int(digits)) if digits else None
+
+    def panel_machine(self, named) -> dict | None:
+        """The machine the panel request names: the code as written, or the id the segment reads as."""
+        return self.machine_named(named)
 
     def panel_booking_id(self, named) -> int | None:
         """The booking the panel request names, the same way `booking_id_of` reads a booking segment."""
@@ -1648,6 +1740,34 @@ class Application:
         return 200, {"outcome": "available", "machine": machine["code"],
                       "message": "Macchina di nuovo disponibile"}
 
+    def handle_owner_trigger(self, body, headers, path=None):
+        """AC1 and AC2: the deterministic trigger, on the same core a customer's report runs.
+
+        There is no randomness in this path: the machine the request names is put out of use, the incident is
+        `fault`, and the pass that follows is the R8 pass — earliest start first, lowest-numbered free machine
+        of the type. The handler decides nothing of its own; it gates on `trigger_gate`, resolves the machine
+        with `machine_named`, and calls `apply_report`, the function the claim surface calls, so the demo, the
+        reviewer's two commands and the test exercise one implementation (`apply_fault` stays the only writer
+        of the hop, asserted in `tests/integration/test_r07_fault_report_coverage.py`).
+
+        It runs on the claim surface with no record to read the entitlement against — `faults.may_move` answers
+        yes for every booking when `admitted_by` is None, and `faults.incident_kind` answers `fault` — so the
+        residue is R8 in full and the incident is the one the reviewer's demo reads. A trigger that lands on a
+        machine already out of service is accepted the same way, the state standing and the incident written:
+        the same call on the same machine gives the same result twice, which is what "no randomness" means for
+        a demo (issue #24, AC1).
+
+        No copy of its own: the answer is the report core's answer, and its Italian copy is the one the report
+        path already writes.
+        """
+        status, denial = self.trigger_gate(headers)
+        if status != entitlements.ALLOWED:
+            return status, denial
+        machine = self.machine_named(body.get("machine"))
+        if machine is None:
+            return entitlements.UNKNOWN_MACHINE, entitlements.unknown_machine()
+        return self.apply_report(self.who_is_asking(headers), machine, "fault", self.clock.now())
+
     def handle_owner_cancel(self, body, headers, path=None):
         """AC2 and AC3: the manual cancellation (US56), gated on the owner flag first.
 
@@ -1730,9 +1850,13 @@ class Application:
         The state of a machine is public information — a machine in `maintenance` must be visibly
         unavailable (US42) — so the single-machine read answers without a session. The board on
         `GET /api/machines` stays the owner panel: it lists the bookings attached to a machine.
+
+        The segment is read through `machine_named`, the one resolution the panel uses too: the code as the
+        board spells it or the number the seed gave the machine (issue #24, AC1 — the reviewer triggers
+        machine `3` and reads machine `3`, and the two are the same object).
         """
         code = (path or "").split("/api/machines/", 1)[1]
-        machine = self.repo.machine(code)
+        machine = self.machine_named(code)
         if machine is None:
             return 404, {"error": "unknown_machine", "message": "Macchina sconosciuta"}
         view = domain.machine_view(machine, self.config)

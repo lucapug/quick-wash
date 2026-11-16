@@ -254,6 +254,23 @@ KNOWN_CONTRADICTIONS = {
         "named; the assertion holds only while the loser's read lands on its own stale snapshot, which the "
         "layer does not promise. Recorded rather than bent.",
 
+    # Issue #24 (the deterministic trigger and the demo seed): the file the issue supplies reads the incident's
+    # `machine` as the number the request named (`3`), while the file issue #18 (R7) supplies reads it as the
+    # machine code the seam answers with (`M3`) — as do `tests/integration/test_r03_grace_and_redemption_coverage.py`,
+    # `test_r06_state_machine.py` and `test_device_reports_coverage.py`, which are all pinned. The incident
+    # names one machine, so the two readings cannot both be the value of the same key: one side has to move and
+    # the executor cannot move either. Every other assertion the supplied file makes is answered as written —
+    # 202, `maintenance`, the same trigger on the same machine giving the same result twice — read back in
+    # `tests/integration/test_deterministic_fault_trigger_coverage.py`, which also shows the number and the code
+    # naming the same machine through `Application.machine_named`. Both files are pinned, so the contradiction
+    # needs a human on which side moves.
+    ("test_deterministic_fault_trigger.py",
+     "test_fault_trigger_on_a_named_machine_is_reproducible"):
+        "issue #24: the supplied test asserts the incident's `machine` as the number (3), issue #18's supplied "
+        "file pins it as the machine code (M3); one key cannot answer both, so the reading is recorded rather "
+        "than bent. The rest of the file — 202, maintenance, the trigger twice giving the same result — runs as "
+        "supplied and is read back in tests/integration/test_deterministic_fault_trigger_coverage.py",
+
     # Issue #19 (R8): the file the issue supplies is executable in every other respect — the notification read
     # exists inside the app (`GET /api/notifications`, a pattern, not a ninth contract entry), the pass issues a
     # new code, the incident vocabulary answers `reassignment` and the notification answers `reassigned`, the
