@@ -6,6 +6,7 @@
 // backend-for-frontend layer between the shell and the tested seam, so the shell cannot re-decide a rule:
 // it displays what the seam decided, in the language the seam answered in.
 
+import React from "react";
 import { useEffect, useState } from "react";
 
 const SEAM = {
