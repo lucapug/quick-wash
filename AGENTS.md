@@ -34,6 +34,7 @@ addendum overrides `docs/spec.md` on:
 - `docs/ESITO.md` — recorded outcome of the harness trial and the transfer map from the winning backlog to this repository's issues.
 - `docs/agent-team-spec.md` — agent team specification: roles and what each owns, the one-issue-in-flight process, the review protocol (GO / GO-con-note / RISUBMIT), the rubric numbers as corrected by the addendum, and the mixed model.
 - `docs/tracker.md` — tracker conventions: one issue = one PR, the branch, the commit subject, the two labels per issue, the title override the router honours, and the evidence-only verdict labels.
+- `docs/deployment.md` — the deployment steps, tier 1 of the Deployment criterion: prerequisites, the run from a clean checkout, seeding, ports, the observability read, the health check, the environment variables as placeholders, the three commands of the failure demo, and where the CI gate runs. No public URL and no continuous deployment.
 
 This index lists every file under `docs/`, one line per file.
 

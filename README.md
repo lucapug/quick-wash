@@ -47,7 +47,7 @@ Stated as facts, not as intentions:
   reviewer reads the telemetry lines through the seam, not through a dashboard.
 - **Deployment and CD are out of scope** (addendum patch 3): no public URL, no continuous deployment.
   The in-scope compensation is CI tier 1 on every pull request plus the deployment steps written in the
-  documentation.
+  documentation ([docs/deployment.md](docs/deployment.md)), which is the tier-1 point this criterion pays.
 - **The one-command start does not include the database.** The compose file in this repository is the
   isolated lab topology (the egress gate and the agent container), not the running application: it
   declares no database service and no service that starts the backend. `src/db.py` prefers PostgreSQL
@@ -153,7 +153,8 @@ and #48, so its trail carries a slice number rather than one issue number.
 Those two files are the whole authoritative spec layer. The outcome recorded by the harness trial is in
 [docs/ESITO.md](docs/ESITO.md); the process and the roles in
 [docs/agent-team-spec.md](docs/agent-team-spec.md); the tracker conventions in
-[docs/tracker.md](docs/tracker.md).
+[docs/tracker.md](docs/tracker.md); the deployment steps, the environment variables, the failure demo and
+where CI runs in [docs/deployment.md](docs/deployment.md).
 
 ## Project context
 
