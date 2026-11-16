@@ -64,9 +64,12 @@ Stated as facts, not as intentions:
 
 Try it is the path to actually run the app — clone, SQLite, `python3 -m src.server`, browser; no compose, no PostgreSQL:
 
+Requires Python ≥ 3.10 (src/static.py uses PEP 604 annotations). On a fresh clone: clone, export the database path, run, open the browser.
+
+
 ```bash
 git clone https://github.com/lucapug/quick-wash.git && cd quick-wash
-export QW_DATABASE_URL=file:$(pwd)/quick-wash.db   # file-backed SQLite: the fallback fires because a path is given
+export QW_DATABASE_URL=$(pwd)/quick-wash.db   # file-backed SQLite (a plain path; the fallback fires because a path is given)
 python3 -m src.server                              # serves the front-end at / on 127.0.0.1:8000 (PORT overrides)
 ```
 
