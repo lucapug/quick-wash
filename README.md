@@ -60,11 +60,35 @@ Stated as facts, not as intentions:
 - **CI is tier 1 only**: the pytest gate on every pull request on the self-hosted factory runner, plus
   the sha256 tamper-check of the tests supplied in an issue. No deploy step.
 
-## Quickstart
+## Try it
 
-The quickstart is the devcontainer plus its compose file. Nothing below is promised beyond what the
-repository contains.
+Try it is the path to actually run the app — clone, SQLite, `python3 -m src.server`, browser; no compose, no PostgreSQL:
 
+```bash
+git clone https://github.com/lucapug/quick-wash.git && cd quick-wash
+export QW_DATABASE_URL=file:$(pwd)/quick-wash.db   # file-backed SQLite: the fallback fires because a path is given
+python3 -m src.server                              # serves the front-end at / on 127.0.0.1:8000 (PORT overrides)
+```
+
+Then open `http://127.0.0.1:8000/` in a browser. No npm step is needed to run it: the app is served from the committed `dist/`.
+
+![Availability view](docs/screenshots/availability.png)
+![Sign in](docs/screenshots/sign-in.png)
+![My bookings with the unlock code](docs/screenshots/my-bookings.png)
+
+*Captured from the running app: the availability view on a fresh database (the
+inventory comes from the pack's configuration), the in-app sign-in — the one-time
+code is shown in the app itself — and the customer's own booking, where the unlock
+code appears only once and only for its owner, with the R4 cutoff, the R11 daily
+limit and the R9 no-show counter live.*
+
+The availability view is populated from the pack's inventory, which is configuration and always present (8 machines: 4 standard + 2 family + 2 quick, opening 07:00–22:00). What starts empty on a fresh database is the bookings list — book one and it appears with its unlock code.
+
+## Development environment (devcontainer lab)
+
+The Development environment is the factory lab — the devcontainer plus its compose file: the egress
+gate and the container the work happens in. It does not start the application, and this section says so
+explicitly. Nothing below is promised beyond what the repository contains.
 ```bash
 # 1. the isolated lab: egress gate + the container the work happens in
 cd .devcontainer
@@ -86,21 +110,6 @@ The seed the tests read is the pack's inventory: 8 machines, 4 standard + 2 fami
 07:00-22:00, closed on Sundays, 15-minute grid, 10-minute grace, 15-minute cancellation window, 10 and
 30 minutes of buffers, 2 bookings per day. Every number is configuration, read back over HTTP, never a
 screen.
-
-## Try it
-
-The path as it was actually run — no compose, no PostgreSQL:
-
-```bash
-git clone https://github.com/lucapug/quick-wash.git && cd quick-wash
-export QW_DATABASE_URL=file:$(pwd)/quick-wash.db   # file-backed SQLite: the fallback fires because a path is given
-python3 -m src.server                              # serves the front-end at / on 127.0.0.1:8000 (PORT overrides)
-```
-
-Then open `http://127.0.0.1:8000/` in a browser. No npm step is needed to run it: the app is served from
-the committed `dist/`. One honesty note: the server does not seed the database — on a fresh file the
-availability view stays empty until the inventory is written through the seam (the `seed` fixture in
-`tests/fixtures.py` is what seeds today).
 
 ## The seam
 
@@ -147,6 +156,7 @@ numbers as carried by the merge commits present in this clone's history:
 | #12 | #57 | The narrow still-occupied claim (R10) read at the report surface |
 | #13 | #58 | Device reports, the in-process simulator, the `idle_open` event |
 | #15 | #56 | The cancellation window (R4) |
+| #46 | #49 | Booking happy path — slice a of #11, the first end-to-end cycle through the persistence constraint |
 | #16 | #64 | The constrained fault report and maintenance (R7) |
 | #17 | #65 | Reassignment with new code and notification (R8) |
 | #18 | #60 | The no-show counter and the booking block (R9) |
@@ -182,6 +192,6 @@ where CI runs in [docs/deployment.md](docs/deployment.md).
 
 - [AGENTS.md](AGENTS.md) — entry point for the agent team, indexes the modular docs under `docs/`. It is
   not a specification.
-- Interface language: Italian. Documentation language: English.
+- Domain copy: Italian (the seam's language, as the pack defines it). UI chrome: English (deviation recorded on #20 — the evaluating audience reads English). Documentation: English.
 - Paths are repository-relative. No host path, no secret, no token, no key in any file, and no internal
   tailnet hostname anywhere in the documentation.
