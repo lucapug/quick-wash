@@ -11,9 +11,9 @@ difference between the two is stated in [Not built today](#not-built-today).
 
 ## What is built
 
-Everything that exists is the domain behind one HTTP seam, its persistence layer and its tests. The
-interface language is Italian (the copy is in the responses the seam answers with); no front-end pages
-are built.
+Everything that exists is the domain behind one HTTP seam, its persistence layer, its tests, and the
+customer front-end the backend serves. The interface language is Italian as the spec defines it; the
+copy that ships is in English — a recorded deviation, see [How it was built](#how-it-was-built).
 
 | Area | Module | What it does today |
 |---|---|---|
@@ -32,6 +32,7 @@ are built.
 | Telemetry | `src/telemetry.py` | Structured lines for the key journey, one metric of customer-blocked events, a trace identifier shared by every line of a journey. The guard refuses rather than redacts: no email, no unlock code, no one-time code, no credential can enter a line. |
 | Notifications | `src/notifications.py` | Inside the app only — no email, no SMS, no push. A notification belongs to the customer the booking belongs to. |
 | Owner panel | `src/app.py` | Status board, machine list, incident list, maintenance toggle, manual cancellation — all gated on the owner flag before anything is read or written. |
+| Customer front-end (served by the backend) | `src/frontend/` | React JSX app, built to `dist/`, committed with force-add and served by the backend itself at `/` through the static mount. The availability view renders the 15-minute grid per type and the earliest start, with a loading shell until the state is read; no unlock code appears in the availability view. Copy in English (deviation recorded on #20). |
 | Tests | `tests/` | Unit tests reserved for the three pure pieces; integration tests drive the whole journey through the HTTP boundary against a real database. |
 
 ## Not built today
@@ -43,8 +44,9 @@ Stated as facts, not as intentions:
   instrumentation half is implemented (`src/telemetry.py`). Nothing alerts and nobody is paged. The
   chain is worth 5/24 (2 + 1 + 2), which is what moves the realistic ceiling to 19/24; the base without
   it is 16 and the user target is 14, against a pass of 10.
-- **There is no customer front-end and no telemetry UI.** The rubric asks for a viewable UI; today the
-  reviewer reads the telemetry lines through the seam, not through a dashboard.
+- **There is no telemetry UI.** The customer front-end exists as the availability view only (see *What
+  is built*): sign-in, booking and unlock remain seam-only paths. The rubric asks for a viewable UI; today
+  the reviewer reads the telemetry lines through the seam, not through a dashboard.
 - **Deployment and CD are out of scope** (addendum patch 3): no public URL, no continuous deployment.
   The in-scope compensation is CI tier 1 on every pull request plus the deployment steps written in the
   documentation ([docs/deployment.md](docs/deployment.md)), which is the tier-1 point this criterion pays.
@@ -84,6 +86,21 @@ The seed the tests read is the pack's inventory: 8 machines, 4 standard + 2 fami
 07:00-22:00, closed on Sundays, 15-minute grid, 10-minute grace, 15-minute cancellation window, 10 and
 30 minutes of buffers, 2 bookings per day. Every number is configuration, read back over HTTP, never a
 screen.
+
+## Try it
+
+The path as it was actually run — no compose, no PostgreSQL:
+
+```bash
+git clone https://github.com/lucapug/quick-wash.git && cd quick-wash
+export QW_DATABASE_URL=file:$(pwd)/quick-wash.db   # file-backed SQLite: the fallback fires because a path is given
+python3 -m src.server                              # serves the front-end at / on 127.0.0.1:8000 (PORT overrides)
+```
+
+Then open `http://127.0.0.1:8000/` in a browser. No npm step is needed to run it: the app is served from
+the committed `dist/`. One honesty note: the server does not seed the database — on a fresh file the
+availability view stays empty until the inventory is written through the seam (the `seed` fixture in
+`tests/fixtures.py` is what seeds today).
 
 ## The seam
 
@@ -136,12 +153,17 @@ numbers as carried by the merge commits present in this clone's history:
 | #19 | #66 | The per-customer daily limit (R11) |
 | #48 | #55 | The loser's 409 shaped as the bounded set the customer can take, slice c of #11 |
 | #61 | #63 | A supplied test restored byte-exact from the fence, with the decision recorded on the issue |
+| #69 | #71 | The customer front-end the backend serves: React shell, availability view, committed-bundle integrity |
 
 Two parts of the evidence are conventions the harness enforces rather than documents it writes: the
 sha256 tamper-check of every test supplied in an issue, and the rule that a supplied file runs exactly
 as given (which is why the contradictions above are recorded in `tests/fixtures.py` instead of resolved
 by editing a test). Booking creation (issue #11) is the work split into slices the tracker shows as #45
 and #48, so its trail carries a slice number rather than one issue number.
+
+Two deviations recorded on the tracker: #20 asked for the customer-facing copy in Italian and the copy
+that ships is in English (decision recorded on the issue); the attempt cap was raised to 90 (`cap:90`),
+the datum feeding cap recalibration.
 
 ## Authoritative spec layer
 
