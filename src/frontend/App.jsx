@@ -103,8 +103,12 @@ export default function App() {
     return <main className="container py-4" data-screen={FIRST_SCREEN}><p>Loading availability…</p></main>;
   }
 
+  // Native forms the seam injects (the sign-in view carries a form method=post action=/api/session with a
+  // type=submit button) would force a navigation and kill the SPA: submit is intercepted in the capture
+  // phase on the outer main, the data-action flow below does the rest.
   return (
-    <main className="container py-4" data-screen={page ? page.screen : null} onClick={act}>
+    <main className="container py-4" data-screen={page ? page.screen : null} onClick={act}
+         onSubmitCapture={(event) => event.preventDefault()}>
       {view && (
         <nav className="navbar navbar-expand border-bottom mb-3">
           <span className="navbar-brand">{view.brand}</span>
